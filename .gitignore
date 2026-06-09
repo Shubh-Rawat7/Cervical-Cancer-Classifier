@@ -104,6 +104,7 @@ logs/
 data/
 checkpoints/
 Checkpoints/
+Herlev Dataset/
 
 # Model binaries and artifacts
 *.pt
