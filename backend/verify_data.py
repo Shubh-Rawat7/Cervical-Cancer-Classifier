@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from PIL import Image, UnidentifiedImageError
 
 from config import CLASS_NAMES, CHECKPOINT_DIR
-from dataset import _image_files
+from preprocessing import list_image_files as _image_files
 
 
 def _ensure_dir(path: Path) -> None:

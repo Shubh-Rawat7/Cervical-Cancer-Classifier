@@ -95,12 +95,22 @@ def build_eval_transform(image_size: int = DEFAULT_IMAGE_SIZE) -> A.Compose:
 
 def build_tta_transforms(image_size: int = DEFAULT_IMAGE_SIZE) -> List[A.Compose]:
     base = build_eval_transform(image_size=image_size)
+    common = [
+        A.Resize(image_size, image_size, interpolation=cv2.INTER_CUBIC),
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+        A.MedianBlur(blur_limit=3, p=1.0),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ]
     tta = [
         base,
-        A.Compose([A.Resize(image_size, image_size, interpolation=cv2.INTER_CUBIC), A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0), A.MedianBlur(blur_limit=3, p=1.0), A.HorizontalFlip(p=1.0), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()]),
-        A.Compose([A.Resize(image_size, image_size, interpolation=cv2.INTER_CUBIC), A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0), A.MedianBlur(blur_limit=3, p=1.0), A.VerticalFlip(p=1.0), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()]),
-        A.Compose([A.Resize(image_size, image_size, interpolation=cv2.INTER_CUBIC), A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0), A.MedianBlur(blur_limit=3, p=1.0), A.Rotate(limit=(20, 20), p=1.0), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()]),
-        A.Compose([A.Resize(image_size, image_size, interpolation=cv2.INTER_CUBIC), A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0), A.MedianBlur(blur_limit=3, p=1.0), A.Affine(scale=(0.95, 1.05), translate_percent=(0.03, 0.03), rotate=(-8, 8), shear=(-6, 6), p=1.0), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()]),
+        A.Compose(common + [A.HorizontalFlip(p=1.0)]),
+        A.Compose(common + [A.VerticalFlip(p=1.0)]),
+        A.Compose(common + [A.Rotate(limit=20, p=1.0)]),
+        A.Compose(common + [A.Affine(scale=(0.95, 1.05), translate_percent=(0.03, 0.03), rotate=(-10, 10), shear=(-6, 6), p=1.0)]),
+        A.Compose(common + [A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=1.0)]),
+        A.Compose(common + [A.GaussNoise(var_limit=(5.0, 20.0), p=1.0)]),
+        A.Compose(common + [A.ShiftScaleRotate(shift_limit=0.03, scale_limit=0.05, rotate_limit=12, p=1.0)]),
     ]
     return tta
 

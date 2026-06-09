@@ -48,6 +48,16 @@ flowchart TD
 - Training uses mixed precision, cosine annealing, early stopping, label smoothing, class-balanced focal loss, and 5-fold cross-validation.
 - Activation ablation is supported for SiLU, GELU, and Mish.
 
+## Pipeline & Model Working
+
+- **Data ingest & cleanup:** `preprocessing.discover_samples()` reads image records; `filter_quality_and_duplicates()` removes corrupted and duplicate images and flags quality issues. `undersample_samples()` and stratified splitting prepare balanced training/validation folds.
+- **Transforms:** Training uses Albumentations pipelines (random flips, rotations, color jitter, CLAHE, blur, random resized crop, normalization). Validation uses deterministic resize/crop and ImageNet normalization.
+- **Model architecture:** `HerlevMambaClassifier` is built on a ViM-style patch backbone (`vim_base_patch16_224`) with Mamba mixer blocks and multi-scale feature fusion. An attention-based fusion head aggregates scales and feeds a classifier head with configurable dropout and activation. Number of output classes is controlled by `config.CLASS_NAMES`.
+- **Loss & sampling:** Training uses `ClassBalancedFocalLoss` which computes effective-number class weights from per-class counts (label smoothing and gamma focal term supported). Optionally `WeightedRandomSampler` oversamples minority classes when `--weighted-sampler` is enabled.
+- **Training loop:** `train.py` builds the model, optimizer (`AdamW`), warmup+cosine scheduler, and optional AMP scaler. Supports gradient accumulation, grad clipping, early stopping (`--patience`), and initial backbone freezing (`--freeze-backbone-epochs`) for head-only warmup.
+- **K-fold & checkpoints:** Stratified K-Fold (default 5) trains independent folds, saving per-fold best checkpoints (`fold_{i}_best.pt`) and producing a k-fold summary JSON with per-fold metrics. Ensemble inference averages per-fold softmax outputs.
+- **Inference & serving:** `inference.py` supports TTA (averaging multiple augmented predictions), ensemble checkpoint averaging, and temperature scaling for calibration. `backend/api/main.py` exposes a FastAPI endpoint for single-image inference and batch endpoints for ensemble/TTA.
+
 ## Inference Strategy
 
 - Single-checkpoint and multi-checkpoint ensemble inference are supported.

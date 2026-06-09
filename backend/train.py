@@ -86,6 +86,51 @@ def _step_batch(model, batch, device):
     return images, labels
 
 
+def _mixup_data(images: torch.Tensor, labels: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+    if alpha <= 0.0:
+        return images, labels
+    lam = float(np.random.beta(alpha, alpha)) if alpha > 0 else 1.0
+    batch_size = images.size(0)
+    index = torch.randperm(batch_size, device=images.device)
+    mixed_images = lam * images + (1.0 - lam) * images[index]
+    labels_a, labels_b = labels, labels[index]
+    return mixed_images, (labels_a, labels_b, lam)
+
+
+def _rand_bbox(size: Sequence[int], lam: float) -> tuple[int, int, int, int]:
+    _, _, H, W = size
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+    return x1, y1, x2, y2
+
+
+def _cutmix_data(images: torch.Tensor, labels: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+    if alpha <= 0.0:
+        return images, labels
+    lam = float(np.random.beta(alpha, alpha))
+    batch_size = images.size(0)
+    index = torch.randperm(batch_size, device=images.device)
+    x1, y1, x2, y2 = _rand_bbox(images.size(), lam)
+    mixed_images = images.clone()
+    mixed_images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+    lam = 1.0 - ((x2 - x1) * (y2 - y1) / float(images.size(2) * images.size(3)))
+    labels_a, labels_b = labels, labels[index]
+    return mixed_images, (labels_a, labels_b, lam)
+
+
+def _mix_targets(targets_a: torch.Tensor, targets_b: torch.Tensor, lam: float, num_classes: int) -> torch.Tensor:
+    one_hot_a = torch.nn.functional.one_hot(targets_a, num_classes=num_classes).float()
+    one_hot_b = torch.nn.functional.one_hot(targets_b, num_classes=num_classes).float()
+    return lam * one_hot_a + (1.0 - lam) * one_hot_b
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -96,6 +141,8 @@ def train_one_epoch(
     accumulation_steps: int = 1,
     grad_clip: float = 1.0,
     use_amp: bool = True,
+    mixup_alpha: float = 0.0,
+    cutmix_alpha: float = 0.0,
 ) -> Dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -105,9 +152,20 @@ def train_one_epoch(
 
     for step, batch in enumerate(loader, start=1):
         images, labels = _step_batch(model, batch, device)
+        labels_orig = labels
+        targets = labels
+        if cutmix_alpha > 0.0 and np.random.rand() < 0.5:
+            images, mix = _cutmix_data(images, labels, cutmix_alpha)
+            labels_a, labels_b, lam = mix
+            targets = _mix_targets(labels_a, labels_b, lam, num_classes=len(CLASS_NAMES))
+        elif mixup_alpha > 0.0:
+            images, mix = _mixup_data(images, labels, mixup_alpha)
+            labels_a, labels_b, lam = mix
+            targets = _mix_targets(labels_a, labels_b, lam, num_classes=len(CLASS_NAMES))
+
         with torch.amp.autocast('cuda', enabled=use_amp):
             logits = model(images)
-            loss = criterion(logits, labels) / max(1, accumulation_steps)
+            loss = criterion(logits, targets) / max(1, accumulation_steps)
 
         scaler.scale(loss).backward()
 
@@ -218,10 +276,25 @@ def fit_single_split(args) -> Dict[str, object]:
     train_samples, val_samples, _ = split_samples(samples, val_size=args.val_split, seed=args.seed)
     train_samples = undersample_samples(train_samples, strategy=args.undersample, seed=args.seed)
 
-    train_loader = _build_loader(train_samples, args.batch_size, args.image_size, shuffle=True, num_workers=args.workers, transform=build_train_transform(args.image_size))
+    # build train loader with optional weighted sampler
+    if args.weighted_sampler:
+        from torch.utils.data import WeightedRandomSampler
+        train_dataset = HerlevDataset(train_samples, transform=build_train_transform(args.image_size))
+        labels = _labels_from_samples(train_samples)
+        class_counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float32)
+        class_weights = 1.0 / np.clip(class_counts, 1.0, None)
+        sample_weights = class_weights[labels]
+        workers = max(0, min(int(args.workers), torch.get_num_threads() or 0))
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True), num_workers=workers, pin_memory=torch.cuda.is_available(), persistent_workers=workers>0, drop_last=True)
+    else:
+        train_loader = _build_loader(train_samples, args.batch_size, args.image_size, shuffle=True, num_workers=args.workers, transform=build_train_transform(args.image_size))
     val_loader = _build_loader(val_samples, args.batch_size, args.image_size, shuffle=False, num_workers=args.workers, transform=build_eval_transform(args.image_size))
 
     model = build_model(args).to(device)
+    # optional freeze of backbone for initial epochs
+    if getattr(args, 'freeze_backbone_epochs', 0) > 0:
+        for p in model.encoder.parameters():
+            p.requires_grad = False
     criterion = build_criterion(
         _counts_tensor(train_samples, device),
         loss_type=args.loss_type,
@@ -237,7 +310,23 @@ def fit_single_split(args) -> Dict[str, object]:
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, accumulation_steps=args.accumulation_steps, grad_clip=args.grad_clip, use_amp=args.amp and device.type == "cuda")
+        # unfreeze backbone after initial freeze epochs
+        if getattr(args, 'freeze_backbone_epochs', 0) > 0 and epoch == args.freeze_backbone_epochs + 1:
+            for p in model.encoder.parameters():
+                p.requires_grad = True
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            accumulation_steps=args.accumulation_steps,
+            grad_clip=args.grad_clip,
+            use_amp=args.amp and device.type == "cuda",
+            mixup_alpha=args.mixup_alpha,
+            cutmix_alpha=args.cutmix_alpha,
+        )
         val_metrics = evaluate(model, val_loader, criterion, device, use_amp=args.amp and device.type == "cuda")
         scheduler.step()
 
@@ -299,10 +388,25 @@ def fit_kfold(args) -> Dict[str, object]:
         fold_train = [samples[i] for i in train_idx]
         fold_val = [samples[i] for i in val_idx]
         fold_train = undersample_samples(fold_train, strategy=args.undersample, seed=args.seed + fold_index)
-        train_loader = _build_loader(fold_train, args.batch_size, args.image_size, shuffle=True, num_workers=args.workers, transform=build_train_transform(args.image_size))
+        # per-fold optional weighted sampler
+        if args.weighted_sampler:
+            from torch.utils.data import WeightedRandomSampler
+            train_dataset = HerlevDataset(fold_train, transform=build_train_transform(args.image_size))
+            labels = _labels_from_samples(fold_train)
+            class_counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float32)
+            class_weights = 1.0 / np.clip(class_counts, 1.0, None)
+            sample_weights = class_weights[labels]
+            workers = max(0, min(int(args.workers), torch.get_num_threads() or 0))
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True), num_workers=workers, pin_memory=torch.cuda.is_available(), persistent_workers=workers>0, drop_last=True)
+        else:
+            train_loader = _build_loader(fold_train, args.batch_size, args.image_size, shuffle=True, num_workers=args.workers, transform=build_train_transform(args.image_size))
         val_loader = _build_loader(fold_val, args.batch_size, args.image_size, shuffle=False, num_workers=args.workers, transform=build_eval_transform(args.image_size))
 
         model = build_model(args).to(device)
+        # optional freeze backbone per-fold
+        if getattr(args, 'freeze_backbone_epochs', 0) > 0:
+            for p in model.encoder.parameters():
+                p.requires_grad = False
         criterion = build_criterion(
             _counts_tensor(fold_train, device),
             loss_type=args.loss_type,
@@ -320,7 +424,19 @@ def fit_kfold(args) -> Dict[str, object]:
         best_path = args.output_dir / f"fold_{fold_index}_best.pt"
 
         for _epoch in range(1, args.epochs + 1):
-            train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, accumulation_steps=args.accumulation_steps, grad_clip=args.grad_clip, use_amp=args.amp and device.type == "cuda")
+            train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                scaler,
+                device,
+                accumulation_steps=args.accumulation_steps,
+                grad_clip=args.grad_clip,
+                use_amp=args.amp and device.type == "cuda",
+                mixup_alpha=args.mixup_alpha,
+                cutmix_alpha=args.cutmix_alpha,
+            )
             val_metrics = evaluate(model, val_loader, criterion, device, use_amp=args.amp and device.type == "cuda")
             scheduler.step()
             if val_metrics["loss"] < best_val_loss:
@@ -406,6 +522,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", action="store_true", default=DEFAULTS.use_amp)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--weighted-sampler", action="store_true", help="Use WeightedRandomSampler to oversample minority classes")
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=0, help="Number of initial epochs to freeze backbone weights")
+    parser.add_argument("--mixup-alpha", type=float, default=0.0, help="MixUp alpha parameter; set >0 to enable MixUp")
+    parser.add_argument("--cutmix-alpha", type=float, default=0.0, help="CutMix alpha parameter; set >0 to enable CutMix")
     return parser
 
 

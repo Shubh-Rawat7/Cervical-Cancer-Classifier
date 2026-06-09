@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from glob import glob
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
@@ -46,6 +47,25 @@ def predict_with_tta(
     return np.mean(probs, axis=0)
 
 
+def resolve_model_paths(
+    model_paths: Sequence[str | Path],
+    model_dir: str | Path | None = None,
+    model_glob: str = "fold_*_best.pt",
+) -> List[Path]:
+    resolved_paths = [Path(p) for p in model_paths if p]
+    if resolved_paths:
+        return resolved_paths
+
+    if model_dir:
+        root = Path(model_dir)
+        if root.is_dir():
+            resolved_paths = sorted(root.glob(model_glob))
+            if resolved_paths:
+                return [Path(p) for p in resolved_paths]
+
+    return [Path(MODEL_PATH)]
+
+
 def predict_image(
     image_path: str | Path,
     model_paths: Sequence[str | Path],
@@ -78,8 +98,10 @@ def predict_image(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Herlev inference with TTA and ensemble averaging")
-    parser.add_argument("--model-path", nargs="*", default=[str(MODEL_PATH)])
-    parser.add_argument("--image-path", required=True)
+    parser.add_argument("--model-path", nargs="*", default=[], help="Paths to model checkpoint files")
+    parser.add_argument("--model-dir", type=str, default="", help="Directory containing model checkpoints to ensemble")
+    parser.add_argument("--model-glob", type=str, default="fold_*_best.pt", help="Pattern to match checkpoint files in model-dir")
+    parser.add_argument("--image-path", required=True, help="Input image file or directory")
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--tta-views", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -88,12 +110,13 @@ def main() -> None:
     args = parser.parse_args()
 
     image_path = Path(args.image_path)
-    model_paths = [Path(path) for path in args.model_path]
+    model_paths = resolve_model_paths(args.model_path, args.model_dir, args.model_glob)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
 
     if image_path.is_dir():
         results = []
-        for file_path in sorted([p for p in image_path.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}]):
+        image_files = sorted([p for p in image_path.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}])
+        for file_path in image_files:
             result = predict_image(file_path, model_paths, image_size=args.image_size, tta_views=args.tta_views, temperature=args.temperature, device=device)
             result["image"] = file_path.name
             results.append(result)
