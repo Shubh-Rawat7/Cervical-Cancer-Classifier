@@ -10,7 +10,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 
-CLASS_NAMES = ["Normal", "CIN1", "CIN2", "CIN3"]
+CLASS_NAMES = ["Normal", "CIN1", "CIN2", "CIN3", "Cancer"]
 NUM_CLASSES = len(CLASS_NAMES)
 
 IMAGE_SIZE_CHOICES = (224,)
