@@ -151,7 +151,7 @@ def _perceptual_hash(path: Path) -> str:
         return _image_digest(path)
 
 
-def verify_image_quality(path: str | Path, min_size: int = 128) -> Tuple[bool, str]:
+def verify_image_quality(path: str | Path, min_size: int = 64) -> Tuple[bool, str]:
     image_path = Path(path)
     try:
         with Image.open(image_path) as image:
@@ -178,7 +178,7 @@ def detect_duplicates(samples: Sequence[ImageRecord]) -> Dict[str, List[Path]]:
 
 def filter_quality_and_duplicates(
     samples: Sequence[ImageRecord],
-    min_size: int = 128,
+    min_size: int = 64,
 ) -> Tuple[List[ImageRecord], Dict[str, List[Path]], List[Tuple[Path, str]]]:
     kept: List[ImageRecord] = []
     issues: List[Tuple[Path, str]] = []
