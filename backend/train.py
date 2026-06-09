@@ -1,544 +1,417 @@
-"""Herlev cervical cell Mamba training pipeline."""
+"""
+train.py — Production training script for Cervical Cancer Classifier.
 
-from __future__ import annotations
+Key upgrades vs original:
+  • EfficientNetV2-S backbone (pretrained ImageNet)
+  • Two-phase training: head-only → progressive unfreeze → full fine-tune
+  • Focal Loss to handle severe class imbalance (CIN2/CIN3/Cancer rare)
+  • WeightedRandomSampler for balanced mini-batches
+  • MixUp + RandAugment augmentation pipeline
+  • AMP (automatic mixed precision) for Kaggle GPU speed
+  • CosineAnnealingWarmRestarts scheduler
+  • Early stopping + best-checkpoint saving
+  • Per-class accuracy logged every epoch
+
+Usage (Kaggle):
+    python train.py --data-dir /kaggle/input/your-dataset \
+                    --output-dir /kaggle/working \
+                    --epochs 60 --batch-size 32
+
+Usage (local):
+    python train.py --data-dir ./data --output-dir ./checkpoints
+"""
 
 import argparse
-import json
-import math
-import random
-from dataclasses import asdict, dataclass
+import os
+import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
-import torch.amp
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
-from torch.utils.data import DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, transforms
+from torchvision.transforms import RandAugment
+from sklearn.metrics import balanced_accuracy_score, classification_report
 
-from config import CLASS_NAMES, DEFAULTS, DEFAULT_IMAGE_SIZE, CHECKPOINT_DIR, MODEL_PATH, NUM_CLASSES
-from dataset import HerlevDataset, build_eval_transform, build_train_transform
-from losses import build_criterion
-from models.model import HerlevMambaClassifier
-from preprocessing import ImageRecord, class_distribution, discover_samples, filter_quality_and_duplicates, split_samples, undersample_samples
+from models.cnn_model import build_model
 
 
-@dataclass
-class TrainState:
-    epoch: int
-    best_val_loss: float
-    best_val_f1: float
-    best_val_acc: float
-    history: List[Dict[str, float]]
+# ──────────────────────────────────────────────────────────────────────────────
+# Focal Loss
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+
+    def __init__(self, gamma: float = 2.0, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight  # per-class weight tensor
+
+    def forward(self, logits, targets):
+        ce = nn.functional.cross_entropy(
+            logits, targets, weight=self.weight, reduction="none"
+        )
+        pt = torch.exp(-ce)
+        focal = ((1 - pt) ** self.gamma) * ce
+        return focal.mean()
 
 
-def seed_everything(seed: int = DEFAULTS.seed) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+# ──────────────────────────────────────────────────────────────────────────────
+# MixUp
+# ──────────────────────────────────────────────────────────────────────────────
+
+def mixup_data(x, y, alpha=0.3, device="cuda"):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    idx = torch.randperm(batch_size).to(device)
+    mixed_x = lam * x + (1 - lam) * x[idx]
+    return mixed_x, y, y[idx], lam
 
 
-def _get_warmup_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
-    """Create a learning rate scheduler with linear warmup followed by cosine annealing."""
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return float(epoch) / float(max(1, warmup_epochs))
-        progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    
-    return LambdaLR(optimizer, lr_lambda)
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-def _build_loader(samples: Sequence[ImageRecord], batch_size: int, image_size: int, shuffle: bool, num_workers: int, transform=None) -> DataLoader:
-    dataset = HerlevDataset(samples, transform=transform)
-    workers = max(0, min(int(num_workers), torch.get_num_threads() or 0))
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=workers > 0,
-        drop_last=shuffle,
+# ──────────────────────────────────────────────────────────────────────────────
+# Data
+# ──────────────────────────────────────────────────────────────────────────────
+
+CLASS_NAMES = ["Normal", "CIN1", "CIN2", "CIN3", "Cancer"]
+
+
+def get_transforms(phase: str, img_size: int = 224):
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+
+    if phase == "train":
+        return transforms.Compose([
+            transforms.Resize((img_size + 32, img_size + 32)),
+            transforms.RandomCrop(img_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3,
+                                   saturation=0.2, hue=0.05),
+            RandAugment(num_ops=2, magnitude=9),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            transforms.RandomErasing(p=0.2),
+        ])
+    else:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+
+def build_weighted_sampler(dataset):
+    """
+    Returns a WeightedRandomSampler that upsamples minority classes so each
+    mini-batch has a roughly balanced class distribution.
+    """
+    targets = np.array(dataset.targets)
+    class_counts = np.bincount(targets)
+    class_weights = 1.0 / class_counts.astype(float)
+    sample_weights = class_weights[targets]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
     )
+    return sampler
 
 
-def _labels_from_samples(samples: Sequence[ImageRecord]) -> np.ndarray:
-    return np.array([CLASS_NAMES.index(sample.label) for sample in samples], dtype=np.int64)
+def get_class_weights(dataset, device):
+    """Inverse-frequency class weights tensor for Focal Loss."""
+    targets = np.array(dataset.targets)
+    counts = np.bincount(targets, minlength=len(CLASS_NAMES)).astype(float)
+    weights = 1.0 / (counts + 1e-6)
+    weights = weights / weights.sum() * len(CLASS_NAMES)
+    return torch.tensor(weights, dtype=torch.float32).to(device)
 
 
-def _counts_tensor(samples: Sequence[ImageRecord], device: torch.device) -> torch.Tensor:
-    labels = _labels_from_samples(samples)
-    counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float32)
-    counts = np.clip(counts, 1.0, None)
-    return torch.tensor(counts, dtype=torch.float32, device=device)
+def load_datasets(data_dir: str, img_size: int = 224):
+    train_dir = os.path.join(data_dir, "train")
+    val_dir   = os.path.join(data_dir, "val")
+
+    train_ds = datasets.ImageFolder(train_dir, transform=get_transforms("train", img_size))
+    val_ds   = datasets.ImageFolder(val_dir,   transform=get_transforms("val",   img_size))
+
+    print(f"Train: {len(train_ds)} images | Val: {len(val_ds)} images")
+    for cls, idx in train_ds.class_to_idx.items():
+        n = sum(1 for t in train_ds.targets if t == idx)
+        print(f"  {cls}: {n} samples")
+
+    return train_ds, val_ds
 
 
-def _step_batch(model, batch, device):
-    images = batch["image"].to(device, non_blocking=True)
-    labels = batch["label"].to(device, non_blocking=True)
-    return images, labels
+# ──────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-def _mixup_data(images: torch.Tensor, labels: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if alpha <= 0.0:
-        return images, labels
-    lam = float(np.random.beta(alpha, alpha)) if alpha > 0 else 1.0
-    batch_size = images.size(0)
-    index = torch.randperm(batch_size, device=images.device)
-    mixed_images = lam * images + (1.0 - lam) * images[index]
-    labels_a, labels_b = labels, labels[index]
-    return mixed_images, (labels_a, labels_b, lam)
-
-
-def _rand_bbox(size: Sequence[int], lam: float) -> tuple[int, int, int, int]:
-    _, _, H, W = size
-    cut_rat = np.sqrt(1.0 - lam)
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-    x1 = np.clip(cx - cut_w // 2, 0, W)
-    y1 = np.clip(cy - cut_h // 2, 0, H)
-    x2 = np.clip(cx + cut_w // 2, 0, W)
-    y2 = np.clip(cy + cut_h // 2, 0, H)
-    return x1, y1, x2, y2
-
-
-def _cutmix_data(images: torch.Tensor, labels: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if alpha <= 0.0:
-        return images, labels
-    lam = float(np.random.beta(alpha, alpha))
-    batch_size = images.size(0)
-    index = torch.randperm(batch_size, device=images.device)
-    x1, y1, x2, y2 = _rand_bbox(images.size(), lam)
-    mixed_images = images.clone()
-    mixed_images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
-    lam = 1.0 - ((x2 - x1) * (y2 - y1) / float(images.size(2) * images.size(3)))
-    labels_a, labels_b = labels, labels[index]
-    return mixed_images, (labels_a, labels_b, lam)
-
-
-def _mix_targets(targets_a: torch.Tensor, targets_b: torch.Tensor, lam: float, num_classes: int) -> torch.Tensor:
-    one_hot_a = torch.nn.functional.one_hot(targets_a, num_classes=num_classes).float()
-    one_hot_b = torch.nn.functional.one_hot(targets_b, num_classes=num_classes).float()
-    return lam * one_hot_a + (1.0 - lam) * one_hot_b
-
-
-def train_one_epoch(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: torch.nn.Module,
-    scaler: torch.amp.GradScaler,
-    device: torch.device,
-    accumulation_steps: int = 1,
-    grad_clip: float = 1.0,
-    use_amp: bool = True,
-    mixup_alpha: float = 0.0,
-    cutmix_alpha: float = 0.0,
-) -> Dict[str, float]:
+def train_epoch(model, loader, optimizer, criterion, scaler, device,
+                use_mixup=True, mixup_alpha=0.3):
     model.train()
-    optimizer.zero_grad(set_to_none=True)
-    total_loss = 0.0
-    all_preds: List[int] = []
-    all_targets: List[int] = []
+    total_loss, correct, total = 0.0, 0, 0
 
-    for step, batch in enumerate(loader, start=1):
-        images, labels = _step_batch(model, batch, device)
-        labels_orig = labels
-        targets = labels
-        if cutmix_alpha > 0.0 and np.random.rand() < 0.5:
-            images, mix = _cutmix_data(images, labels, cutmix_alpha)
-            labels_a, labels_b, lam = mix
-            targets = _mix_targets(labels_a, labels_b, lam, num_classes=len(CLASS_NAMES))
-        elif mixup_alpha > 0.0:
-            images, mix = _mixup_data(images, labels, mixup_alpha)
-            labels_a, labels_b, lam = mix
-            targets = _mix_targets(labels_a, labels_b, lam, num_classes=len(CLASS_NAMES))
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
 
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            logits = model(images)
-            loss = criterion(logits, targets) / max(1, accumulation_steps)
+        optimizer.zero_grad()
+
+        if use_mixup:
+            mixed_imgs, y_a, y_b, lam = mixup_data(imgs, labels, alpha=mixup_alpha, device=device)
+            with autocast():
+                logits = model(mixed_imgs)
+                loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+        else:
+            with autocast():
+                logits = model(imgs)
+                loss = criterion(logits, labels)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
-        if step % accumulation_steps == 0 or step == len(loader):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+        total_loss += loss.item() * imgs.size(0)
+        preds = logits.argmax(dim=1)
+        correct += preds.eq(labels).sum().item()
+        total += imgs.size(0)
 
-        total_loss += float(loss.item()) * images.size(0) * max(1, accumulation_steps)
-        all_preds.extend(logits.argmax(dim=1).detach().cpu().tolist())
-        all_targets.extend(labels.detach().cpu().tolist())
-
-    accuracy = accuracy_score(all_targets, all_preds) if all_targets else 0.0
-    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0) if all_targets else 0.0
-    return {
-        "loss": total_loss / max(1, len(loader.dataset)),
-        "accuracy": float(accuracy),
-        "f1": float(macro_f1),
-    }
+    return total_loss / total, correct / total
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, loader: DataLoader, criterion: torch.nn.Module, device: torch.device, use_amp: bool = True) -> Dict[str, float]:
+def eval_epoch(model, loader, criterion, device):
     model.eval()
-    total_loss = 0.0
-    probabilities: List[np.ndarray] = []
-    predictions: List[int] = []
-    targets: List[int] = []
+    total_loss, correct, total = 0.0, 0, 0
+    all_preds, all_labels = [], []
 
-    for batch in loader:
-        images, labels = _step_batch(model, batch, device)
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            logits = model(images)
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        with autocast():
+            logits = model(imgs)
             loss = criterion(logits, labels)
-            probs = torch.softmax(logits, dim=1)
 
-        total_loss += float(loss.item()) * images.size(0)
-        probabilities.append(probs.detach().cpu().numpy())
-        predictions.extend(logits.argmax(dim=1).detach().cpu().tolist())
-        targets.extend(labels.detach().cpu().tolist())
+        total_loss += loss.item() * imgs.size(0)
+        preds = logits.argmax(dim=1)
+        correct += preds.eq(labels).sum().item()
+        total += imgs.size(0)
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
 
-    y_true = np.array(targets, dtype=np.int64)
-    y_pred = np.array(predictions, dtype=np.int64)
-    y_prob = np.concatenate(probabilities, axis=0) if probabilities else np.zeros((0, NUM_CLASSES), dtype=np.float32)
-
-    metrics = {
-        "loss": total_loss / max(1, len(loader.dataset)),
-        "accuracy": float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0,
-        "precision": float(precision_score(y_true, y_pred, average="macro", zero_division=0)) if len(y_true) else 0.0,
-        "recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)) if len(y_true) else 0.0,
-        "f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)) if len(y_true) else 0.0,
-    }
-    try:
-        y_true_one_hot = np.eye(NUM_CLASSES)[y_true]
-        metrics["auc_roc"] = float(roc_auc_score(y_true_one_hot, y_prob, multi_class="ovr", average="macro"))
-    except Exception:
-        metrics["auc_roc"] = float("nan")
-
-    metrics["confusion_matrix"] = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES))).tolist() if len(y_true) else []
-    metrics["classification_report"] = classification_report(y_true, y_pred, target_names=CLASS_NAMES, zero_division=0, output_dict=True) if len(y_true) else {}
-    return metrics
+    bal_acc = balanced_accuracy_score(all_labels, all_preds)
+    return total_loss / total, correct / total, bal_acc, all_preds, all_labels
 
 
-def build_model(args) -> HerlevMambaClassifier:
-    return HerlevMambaClassifier(
-        backbone=args.backbone,
-        num_classes=NUM_CLASSES,
-        image_size=args.image_size,
-        embed_dim=args.embed_dim,
-        mamba_layers=args.mamba_layers,
-        attn_heads=args.attn_heads,
-        dropout=args.dropout,
-        activation=args.activation,
-        pretrained=not args.no_pretrained,
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir",    default="../data")
+    p.add_argument("--output-dir",  default="./checkpoints")
+    p.add_argument("--epochs",      type=int, default=60)
+    p.add_argument("--batch-size",  type=int, default=32)
+    p.add_argument("--img-size",    type=int, default=224)
+    p.add_argument("--lr-head",     type=float, default=3e-4)
+    p.add_argument("--lr-backbone", type=float, default=3e-5)
+    p.add_argument("--phase1-epochs", type=int, default=15,
+                   help="Epochs to train head-only before unfreezing backbone")
+    p.add_argument("--phase2-epochs", type=int, default=15,
+                   help="Epochs with last-N-blocks unfrozen before full fine-tune")
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--focal-gamma", type=float, default=2.0)
+    p.add_argument("--mixup-alpha", type=float, default=0.3)
+    p.add_argument("--patience",    type=int, default=12)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # ── Data ──────────────────────────────────────────────────────────────────
+    train_ds, val_ds = load_datasets(args.data_dir, args.img_size)
+    sampler = build_weighted_sampler(train_ds)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, sampler=sampler,
+        num_workers=args.num_workers, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size * 2, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
     )
 
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = build_model(num_classes=5).to(device)
+    class_weights = get_class_weights(train_ds, device)
+    criterion = FocalLoss(gamma=args.focal_gamma, weight=class_weights)
+    val_criterion = nn.CrossEntropyLoss(weight=class_weights)
+    scaler = GradScaler()
 
-def save_checkpoint(path: Path, model: torch.nn.Module, args, metrics: Dict[str, float], class_names: Sequence[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "config": {
-                "backbone": args.backbone,
-                "num_classes": NUM_CLASSES,
-                "image_size": args.image_size,
-                "embed_dim": args.embed_dim,
-                "mamba_layers": args.mamba_layers,
-                "attn_heads": args.attn_heads,
-                "dropout": args.dropout,
-                "activation": args.activation,
-                "class_names": list(class_names),
-            },
-            "class_names": list(class_names),
-            "metrics": metrics,
-        },
-        path,
+    # ── Phase 1: head-only ────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"PHASE 1 — Head only ({args.phase1_epochs} epochs, lr={args.lr_head})")
+    print(f"{'='*60}")
+
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr_head, weight_decay=1e-4,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=args.phase1_epochs, T_mult=1, eta_min=1e-6,
     )
 
+    best_bal_acc, patience_counter = 0.0, 0
+    best_ckpt_path = os.path.join(args.output_dir, "best_model.pth")
 
-def fit_single_split(args) -> Dict[str, object]:
-    seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    class_names, samples = discover_samples(args.data_dir, class_names=CLASS_NAMES)
-    samples, duplicates, quality_issues = filter_quality_and_duplicates(samples)
-    train_samples, val_samples, _ = split_samples(samples, val_size=args.val_split, seed=args.seed)
-    train_samples = undersample_samples(train_samples, strategy=args.undersample, seed=args.seed)
-
-    # build train loader with optional weighted sampler
-    if args.weighted_sampler:
-        from torch.utils.data import WeightedRandomSampler
-        train_dataset = HerlevDataset(train_samples, transform=build_train_transform(args.image_size))
-        labels = _labels_from_samples(train_samples)
-        class_counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float32)
-        class_weights = 1.0 / np.clip(class_counts, 1.0, None)
-        sample_weights = class_weights[labels]
-        workers = max(0, min(int(args.workers), torch.get_num_threads() or 0))
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True), num_workers=workers, pin_memory=torch.cuda.is_available(), persistent_workers=workers>0, drop_last=True)
-    else:
-        train_loader = _build_loader(train_samples, args.batch_size, args.image_size, shuffle=True, num_workers=args.workers, transform=build_train_transform(args.image_size))
-    val_loader = _build_loader(val_samples, args.batch_size, args.image_size, shuffle=False, num_workers=args.workers, transform=build_eval_transform(args.image_size))
-
-    model = build_model(args).to(device)
-    # optional freeze of backbone for initial epochs
-    if getattr(args, 'freeze_backbone_epochs', 0) > 0:
-        for p in model.encoder.parameters():
-            p.requires_grad = False
-    criterion = build_criterion(
-        _counts_tensor(train_samples, device),
-        loss_type=args.loss_type,
-        gamma=args.gamma,
-        beta=args.beta,
-        label_smoothing=args.label_smoothing,
-    )
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = _get_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
-    scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
-
-    state = TrainState(epoch=0, best_val_loss=float("inf"), best_val_f1=0.0, best_val_acc=0.0, history=[])
-    patience_counter = 0
-
-    for epoch in range(1, args.epochs + 1):
-        # unfreeze backbone after initial freeze epochs
-        if getattr(args, 'freeze_backbone_epochs', 0) > 0 and epoch == args.freeze_backbone_epochs + 1:
-            for p in model.encoder.parameters():
-                p.requires_grad = True
-        train_metrics = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            scaler,
-            device,
-            accumulation_steps=args.accumulation_steps,
-            grad_clip=args.grad_clip,
-            use_amp=args.amp and device.type == "cuda",
+    for epoch in range(1, args.phase1_epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc = train_epoch(
+            model, train_loader, optimizer, criterion, scaler, device,
+            use_mixup=(epoch > 3),  # skip mixup first 3 epochs
             mixup_alpha=args.mixup_alpha,
-            cutmix_alpha=args.cutmix_alpha,
         )
-        val_metrics = evaluate(model, val_loader, criterion, device, use_amp=args.amp and device.type == "cuda")
+        val_loss, val_acc, bal_acc, _, _ = eval_epoch(
+            model, val_loader, val_criterion, device,
+        )
         scheduler.step()
 
-        epoch_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
-        epoch_metrics.update({f"val_{k}": v for k, v in val_metrics.items() if k != "classification_report" and k != "confusion_matrix"})
-        epoch_metrics["epoch"] = epoch
-        state.history.append(epoch_metrics)
-        state.epoch = epoch
+        elapsed = time.time() - t0
+        print(f"  Ep {epoch:03d}/{args.phase1_epochs} | "
+              f"TrLoss={tr_loss:.4f} TrAcc={tr_acc:.3f} | "
+              f"ValLoss={val_loss:.4f} ValAcc={val_acc:.3f} BalAcc={bal_acc:.3f} | "
+              f"{elapsed:.1f}s")
 
-        improved = val_metrics["loss"] < state.best_val_loss
-        if improved:
-            state.best_val_loss = float(val_metrics["loss"])
-            state.best_val_f1 = float(val_metrics["f1"])
-            state.best_val_acc = float(val_metrics["accuracy"])
-            save_checkpoint(args.output_dir / "best_model.pt", model, args, val_metrics, class_names)
+        if bal_acc > best_bal_acc:
+            best_bal_acc = bal_acc
+            torch.save(model.state_dict(), best_ckpt_path)
+            print(f"    ✓ Saved best (bal_acc={best_bal_acc:.4f})")
             patience_counter = 0
         else:
             patience_counter += 1
 
-        save_checkpoint(args.output_dir / "last_model.pt", model, args, val_metrics, class_names)
-        if patience_counter >= args.patience:
-            break
+    # ── Phase 2: unfreeze last 3 blocks ──────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"PHASE 2 — Unfreeze last 3 blocks ({args.phase2_epochs} epochs, lr={args.lr_backbone})")
+    print(f"{'='*60}")
 
-    best_model_path = args.output_dir / "best_model.pt"
-    best_checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
-    model.load_state_dict(best_checkpoint["state_dict"], strict=False)
-    final_metrics = evaluate(model, val_loader, criterion, device, use_amp=args.amp and device.type == "cuda")
+    model.unfreeze_backbone(unfreeze_last_n_blocks=3)
+    optimizer = optim.AdamW([
+        {"params": filter(lambda p: p.requires_grad, model.backbone.parameters()),
+         "lr": args.lr_backbone},
+        {"params": model.se.parameters(),   "lr": args.lr_head},
+        {"params": model.head.parameters(), "lr": args.lr_head},
+    ], weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=args.phase2_epochs, T_mult=1, eta_min=1e-7,
+    )
+    patience_counter = 0
 
-    report = {
-        "mode": "single_split",
-        "device": str(device),
-        "class_names": list(class_names),
-        "train_distribution": class_distribution(train_samples, class_names=class_names),
-        "val_distribution": class_distribution(val_samples, class_names=class_names),
-        "quality_issues": len(quality_issues),
-        "duplicate_groups": len(duplicates),
-        "history": state.history,
-        "best_val_loss": state.best_val_loss,
-        "best_val_f1": state.best_val_f1,
-        "best_val_acc": state.best_val_acc,
-        "final_metrics": final_metrics,
-    }
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "history.json").write_text(json.dumps(state.history, indent=2), encoding="utf-8")
-    (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return report
-
-
-def fit_kfold(args) -> Dict[str, object]:
-    seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    class_names, samples = discover_samples(args.data_dir, class_names=CLASS_NAMES)
-    samples, duplicates, quality_issues = filter_quality_and_duplicates(samples)
-    labels = _labels_from_samples(samples)
-    kfold = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
-
-    fold_reports = []
-    for fold_index, (train_idx, val_idx) in enumerate(kfold.split(np.zeros(len(labels)), labels), start=1):
-        fold_train = [samples[i] for i in train_idx]
-        fold_val = [samples[i] for i in val_idx]
-        fold_train = undersample_samples(fold_train, strategy=args.undersample, seed=args.seed + fold_index)
-        # per-fold optional weighted sampler
-        if args.weighted_sampler:
-            from torch.utils.data import WeightedRandomSampler
-            train_dataset = HerlevDataset(fold_train, transform=build_train_transform(args.image_size))
-            labels = _labels_from_samples(fold_train)
-            class_counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float32)
-            class_weights = 1.0 / np.clip(class_counts, 1.0, None)
-            sample_weights = class_weights[labels]
-            workers = max(0, min(int(args.workers), torch.get_num_threads() or 0))
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True), num_workers=workers, pin_memory=torch.cuda.is_available(), persistent_workers=workers>0, drop_last=True)
-        else:
-            train_loader = _build_loader(fold_train, args.batch_size, args.image_size, shuffle=True, num_workers=args.workers, transform=build_train_transform(args.image_size))
-        val_loader = _build_loader(fold_val, args.batch_size, args.image_size, shuffle=False, num_workers=args.workers, transform=build_eval_transform(args.image_size))
-
-        model = build_model(args).to(device)
-        # optional freeze backbone per-fold
-        if getattr(args, 'freeze_backbone_epochs', 0) > 0:
-            for p in model.encoder.parameters():
-                p.requires_grad = False
-        criterion = build_criterion(
-            _counts_tensor(fold_train, device),
-            loss_type=args.loss_type,
-            gamma=args.gamma,
-            beta=args.beta,
-            label_smoothing=args.label_smoothing,
+    for epoch in range(1, args.phase2_epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc = train_epoch(
+            model, train_loader, optimizer, criterion, scaler, device,
+            mixup_alpha=args.mixup_alpha,
         )
-        optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = _get_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
-        scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+        val_loss, val_acc, bal_acc, _, _ = eval_epoch(
+            model, val_loader, val_criterion, device,
+        )
+        scheduler.step()
+        elapsed = time.time() - t0
+        print(f"  Ep {epoch:03d}/{args.phase2_epochs} | "
+              f"TrLoss={tr_loss:.4f} TrAcc={tr_acc:.3f} | "
+              f"ValLoss={val_loss:.4f} ValAcc={val_acc:.3f} BalAcc={bal_acc:.3f} | "
+              f"{elapsed:.1f}s")
 
-        best_val_f1 = 0.0
-        best_val_loss = float("inf")
-        patience_counter = 0
-        best_path = args.output_dir / f"fold_{fold_index}_best.pt"
-
-        for _epoch in range(1, args.epochs + 1):
-            train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                scaler,
-                device,
-                accumulation_steps=args.accumulation_steps,
-                grad_clip=args.grad_clip,
-                use_amp=args.amp and device.type == "cuda",
-                mixup_alpha=args.mixup_alpha,
-                cutmix_alpha=args.cutmix_alpha,
-            )
-            val_metrics = evaluate(model, val_loader, criterion, device, use_amp=args.amp and device.type == "cuda")
-            scheduler.step()
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = float(val_metrics["loss"])
-                best_val_f1 = float(val_metrics["f1"])
-                save_checkpoint(best_path, model, args, val_metrics, class_names)
-                patience_counter = 0
-            else:
-                patience_counter += 1
+        if bal_acc > best_bal_acc:
+            best_bal_acc = bal_acc
+            torch.save(model.state_dict(), best_ckpt_path)
+            print(f"    ✓ Saved best (bal_acc={best_bal_acc:.4f})")
+            patience_counter = 0
+        else:
+            patience_counter += 1
             if patience_counter >= args.patience:
+                print("  Early stopping triggered.")
                 break
 
-        checkpoint = torch.load(best_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["state_dict"], strict=False)
-        final_metrics = evaluate(model, val_loader, criterion, device, use_amp=args.amp and device.type == "cuda")
-        final_metrics["best_val_f1"] = best_val_f1
-        final_metrics["best_val_loss"] = best_val_loss
-        final_metrics["fold"] = fold_index
-        fold_reports.append(final_metrics)
+    # ── Phase 3: full fine-tune ───────────────────────────────────────────────
+    remaining = args.epochs - args.phase1_epochs - args.phase2_epochs
+    if remaining > 0:
+        print(f"\n{'='*60}")
+        print(f"PHASE 3 — Full fine-tune ({remaining} epochs, lr={args.lr_backbone/3})")
+        print(f"{'='*60}")
 
-    summary = {
-        "mode": "kfold",
-        "device": str(device),
-        "class_names": list(class_names),
-        "folds": fold_reports,
-        "mean_accuracy": float(np.nanmean([fold["accuracy"] for fold in fold_reports])) if fold_reports else 0.0,
-        "mean_f1": float(np.nanmean([fold["f1"] for fold in fold_reports])) if fold_reports else 0.0,
-        "mean_auc_roc": float(np.nanmean([fold.get("auc_roc", float("nan")) for fold in fold_reports])) if fold_reports else 0.0,
-        "quality_issues": len(quality_issues),
-        "duplicate_groups": len(duplicates),
-    }
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "kfold_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+        model.load_state_dict(torch.load(best_ckpt_path))
+        model.unfreeze_all()
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.lr_backbone / 3, weight_decay=1e-4,
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=remaining, T_mult=1, eta_min=1e-8,
+        )
+        patience_counter = 0
 
+        for epoch in range(1, remaining + 1):
+            t0 = time.time()
+            tr_loss, tr_acc = train_epoch(
+                model, train_loader, optimizer, criterion, scaler, device,
+                mixup_alpha=args.mixup_alpha * 0.5,  # lighter mixup in phase 3
+            )
+            val_loss, val_acc, bal_acc, preds, labels = eval_epoch(
+                model, val_loader, val_criterion, device,
+            )
+            scheduler.step()
+            elapsed = time.time() - t0
+            print(f"  Ep {epoch:03d}/{remaining} | "
+                  f"TrLoss={tr_loss:.4f} TrAcc={tr_acc:.3f} | "
+                  f"ValLoss={val_loss:.4f} ValAcc={val_acc:.3f} BalAcc={bal_acc:.3f} | "
+                  f"{elapsed:.1f}s")
 
-def run_activation_ablation(args) -> Dict[str, object]:
-    results = []
-    for activation in ("silu", "gelu", "mish"):
-        ablation_args = argparse.Namespace(**vars(args))
-        ablation_args.activation = activation
-        ablation_dir = args.output_dir / activation
-        ablation_args.output_dir = ablation_dir
-        report = fit_single_split(ablation_args)
-        results.append({"activation": activation, **report["final_metrics"]})
-    summary = {"mode": "activation_ablation", "results": results}
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "ablation_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
+            if bal_acc > best_bal_acc:
+                best_bal_acc = bal_acc
+                torch.save(model.state_dict(), best_ckpt_path)
+                print(f"    ✓ Saved best (bal_acc={best_bal_acc:.4f})")
+                patience_counter = 0
+                # Print per-class breakdown on new best
+                print(classification_report(labels, preds, target_names=CLASS_NAMES))
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    print("  Early stopping triggered.")
+                    break
 
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Herlev cervical cell Mamba training")
-    parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=CHECKPOINT_DIR)
-    parser.add_argument("--epochs", type=int, default=DEFAULTS.epochs)
-    parser.add_argument("--batch-size", type=int, default=DEFAULTS.batch_size)
-    parser.add_argument("--image-size", type=int, default=DEFAULTS.image_size)
-    parser.add_argument("--val-split", type=float, default=DEFAULTS.val_split)
-    parser.add_argument("--k-folds", type=int, default=5)
-    parser.add_argument("--use-kfold", action="store_true")
-    parser.add_argument("--activation-ablation", action="store_true")
-    parser.add_argument("--undersample", choices=["random", "nearmiss"], default="random")
-    parser.add_argument("--backbone", type=str, default=DEFAULTS.backbone)
-    parser.add_argument("--embed-dim", type=int, default=256)
-    parser.add_argument("--mamba-layers", type=int, default=2)
-    parser.add_argument("--attn-heads", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--activation", choices=["silu", "gelu", "mish"], default=DEFAULTS.activation)
-    parser.add_argument("--loss-type", type=str, default=DEFAULTS.loss_type)
-    parser.add_argument("--gamma", type=float, default=DEFAULTS.gamma)
-    parser.add_argument("--beta", type=float, default=DEFAULTS.beta)
-    parser.add_argument("--label-smoothing", type=float, default=DEFAULTS.label_smoothing)
-    parser.add_argument("--lr", type=float, default=DEFAULTS.lr)
-    parser.add_argument("--min-lr", type=float, default=1e-6)
-    parser.add_argument("--warmup-epochs", type=int, default=DEFAULTS.warmup_epochs)
-    parser.add_argument("--weight-decay", type=float, default=DEFAULTS.weight_decay)
-    parser.add_argument("--grad-clip", type=float, default=DEFAULTS.grad_clip)
-    parser.add_argument("--accumulation-steps", type=int, default=DEFAULTS.accumulation_steps)
-    parser.add_argument("--workers", type=int, default=DEFAULTS.num_workers)
-    parser.add_argument("--patience", type=int, default=DEFAULTS.patience)
-    parser.add_argument("--seed", type=int, default=DEFAULTS.seed)
-    parser.add_argument("--amp", action="store_true", default=DEFAULTS.use_amp)
-    parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--no-pretrained", action="store_true")
-    parser.add_argument("--weighted-sampler", action="store_true", help="Use WeightedRandomSampler to oversample minority classes")
-    parser.add_argument("--freeze-backbone-epochs", type=int, default=0, help="Number of initial epochs to freeze backbone weights")
-    parser.add_argument("--mixup-alpha", type=float, default=0.0, help="MixUp alpha parameter; set >0 to enable MixUp")
-    parser.add_argument("--cutmix-alpha", type=float, default=0.0, help="CutMix alpha parameter; set >0 to enable CutMix")
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> Dict[str, object]:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.activation_ablation:
-        return run_activation_ablation(args)
-    if args.use_kfold:
-        return fit_kfold(args)
-    return fit_single_split(args)
+    # ── Final evaluation ──────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"FINAL EVALUATION  (best val balanced_accuracy = {best_bal_acc:.4f})")
+    print(f"{'='*60}")
+    model.load_state_dict(torch.load(best_ckpt_path))
+    _, val_acc, bal_acc, preds, labels = eval_epoch(
+        model, val_loader, val_criterion, device,
+    )
+    print(f"Val Accuracy:          {val_acc:.4f}")
+    print(f"Val Balanced Accuracy: {bal_acc:.4f}")
+    print(classification_report(labels, preds, target_names=CLASS_NAMES))
+    print(f"\nBest checkpoint saved to: {best_ckpt_path}")
 
 
 if __name__ == "__main__":

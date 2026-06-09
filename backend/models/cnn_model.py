@@ -1,166 +1,108 @@
 """
-backend/models/cnn_model.py
-============================
-REPLACED: 6-layer custom CNN  →  EfficientNetV2-S  (ImageNet pretrained)
-
-WHY THIS CHANGE:
-  - Original 6-conv custom CNN trained from scratch on only 750 images is
-    guaranteed to overfit. Train acc 95% vs val 88% in the README confirms it.
-  - EfficientNetV2-S pretrained on ImageNet already knows edges, textures,
-    and shapes. We only need to fine-tune the final layers on our 5 classes.
-  - Expected accuracy: 93-96% val acc (vs current 88%)
-  - Computational cost: comparable to the old 6-conv model on GPU;
-    slightly heavier on CPU but acceptable.
+cnn_model.py — EfficientNetV2-S backbone with SE channel attention head.
+Drop-in replacement for the original 6-layer CNN.
+Targets 5-class cervical cancer classification: Normal, CIN1, CIN2, CIN3, Cancer.
 """
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
+import timm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  DROP-IN MODEL  (EfficientNetV2-S, recommended)
-# ─────────────────────────────────────────────────────────────────────────────
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention."""
 
-class CervicalCancerCNN(nn.Module):
-    """
-    EfficientNetV2-S backbone + custom classification head.
-
-    Two-phase training supported:
-      phase=1  →  freeze backbone, train head only   (5-10 epochs)
-      phase=2  →  unfreeze all layers, fine-tune     (remaining epochs)
-    """
-
-    NUM_CLASSES = 5   # Normal, CIN1, CIN2, CIN3, Cancer
-
-    def __init__(self, num_classes: int = NUM_CLASSES, dropout: float = 0.4):
+    def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
-
-        # ── backbone ────────────────────────────────────────────────────────
-        weights = models.EfficientNet_V2_S_Weights.IMAGENET1K_V1
-        backbone = models.efficientnet_v2_s(weights=weights)
-
-        # Remove the stock classifier; keep the feature extractor
-        in_features = backbone.classifier[1].in_features  # 1280
-        backbone.classifier = nn.Identity()
-        self.backbone = backbone
-
-        # ── custom head ─────────────────────────────────────────────────────
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),          # safety pool (already done inside backbone)
-            nn.Flatten(),
-            nn.BatchNorm1d(in_features),
-            nn.Dropout(p=dropout),
-            nn.Linear(in_features, 512),
-            nn.SiLU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(p=dropout / 2),
-            nn.Linear(512, num_classes),
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid(),
         )
 
-        # initialise head weights
-        for m in self.classifier.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    # ── phase control ────────────────────────────────────────────────────────
-    def freeze_backbone(self):
-        """Phase 1: only train the head."""
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        for p in self.classifier.parameters():
-            p.requires_grad = True
-
-    def unfreeze_backbone(self, unfreeze_last_n_blocks: int = 4):
-        """
-        Phase 2: unfreeze the last N blocks of the backbone for fine-tuning.
-        Unfreezing everything at once on 750 images causes overfitting.
-        Start with 4 blocks, increase if val loss keeps improving.
-        """
-        # first freeze everything
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-        # then selectively unfreeze
-        blocks = list(self.backbone.features.children())
-        for block in blocks[-unfreeze_last_n_blocks:]:
-            for p in block.parameters():
-                p.requires_grad = True
-
-        # always train the head
-        for p in self.classifier.parameters():
-            p.requires_grad = True
-
-    def unfreeze_all(self):
-        """Unfreeze the entire network (use only with large datasets)."""
-        for p in self.parameters():
-            p.requires_grad = True
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(x)          # (B, 1280)
-        # EfficientNetV2 already applies AdaptiveAvgPool + Flatten internally
-        # when classifier is Identity(). But shape is (B, 1280) so skip extra pool.
-        x = nn.functional.dropout(features, p=0.0, training=False)
-        # ── head (skip the AdaptiveAvgPool+Flatten since features are already flat)
-        x = self.classifier[2](features)     # BN1d
-        x = self.classifier[3](x)            # Dropout
-        x = self.classifier[4](x)            # Linear 1280→512
-        x = self.classifier[5](x)            # SiLU
-        x = self.classifier[6](x)            # BN1d
-        x = self.classifier[7](x)            # Dropout
-        x = self.classifier[8](x)            # Linear 512→5
-        return x
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        w = self.pool(x).view(b, c)
+        w = self.fc(w).view(b, c, 1, 1)
+        return x * w
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  ALTERNATIVE: DenseNet121  (lighter, also excellent for medical imaging)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CervicalDenseNet(nn.Module):
+class CervicalClassifier(nn.Module):
     """
-    DenseNet121 alternative. Dense connections naturally act as deep supervision,
-    making them very strong on small medical datasets.
-    Expected val accuracy: 91-94%.
+    EfficientNetV2-S pretrained on ImageNet → SE attention → 5-class head.
+
+    Two-phase training:
+        Phase 1 (freeze=True)  : only head + SE block trained
+        Phase 2 (freeze=False) : full fine-tune with lower LR on backbone
     """
+
+    NUM_CLASSES = 5
+    BACKBONE_OUT = 1280  # EfficientNetV2-S final feature dim
 
     def __init__(self, num_classes: int = 5, dropout: float = 0.4):
         super().__init__()
-        weights = models.DenseNet121_Weights.IMAGENET1K_V1
-        backbone = models.densenet121(weights=weights)
-        in_features = backbone.classifier.in_features  # 1024
-        backbone.classifier = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(in_features, num_classes),
+        self.num_classes = num_classes
+
+        # Pretrained backbone — features only (no classifier)
+        self.backbone = timm.create_model(
+            "tf_efficientnetv2_s",
+            pretrained=True,
+            num_classes=0,   # remove timm head
+            global_pool="",  # remove global pool so we get spatial features
         )
-        self.backbone = backbone
+        feat_dim = self.backbone.num_features  # 1280 for v2-s
 
-    def freeze_backbone(self):
-        for name, p in self.backbone.named_parameters():
-            if "classifier" not in name:
-                p.requires_grad = False
+        self.se = SEBlock(feat_dim, reduction=16)
+        self.pool = nn.AdaptiveAvgPool2d(1)
 
-    def unfreeze_backbone(self):
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(feat_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(512, num_classes),
+        )
+
+        self._freeze_backbone()
+
+    # ------------------------------------------------------------------
+    def _freeze_backbone(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+    def unfreeze_backbone(self, unfreeze_last_n_blocks: int = 3):
+        """Progressively unfreeze the last N blocks of the backbone."""
+        blocks = list(self.backbone.blocks)
+        for block in blocks[-unfreeze_last_n_blocks:]:
+            for p in block.parameters():
+                p.requires_grad = True
+        # Always keep BN stats frozen on shallow layers
+        for m in self.backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad = False
+
+    def unfreeze_all(self):
         for p in self.backbone.parameters():
             p.requires_grad = True
 
+    # ------------------------------------------------------------------
     def forward(self, x):
-        return self.backbone(x)
+        feat = self.backbone.forward_features(x)  # (B, C, H, W)
+        feat = self.se(feat)
+        feat = self.pool(feat).flatten(1)          # (B, C)
+        return self.head(feat)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Quick sanity check
-# ─────────────────────────────────────────────────────────────────────────────
+def build_model(num_classes: int = 5, dropout: float = 0.4) -> CervicalClassifier:
+    return CervicalClassifier(num_classes=num_classes, dropout=dropout)
+
+
 if __name__ == "__main__":
-    model = CervicalCancerCNN()
-    model.freeze_backbone()
-    dummy = torch.randn(4, 3, 224, 224)
-    out = model(dummy)
-    print(f"Output shape: {out.shape}")   # Expected: (4, 5)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params (phase 1): {trainable:,} / {total:,}")
-
-    model.unfreeze_backbone(unfreeze_last_n_blocks=4)
-    trainable2 = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params (phase 2): {trainable2:,} / {total:,}")
+    m = build_model()
+    x = torch.randn(2, 3, 224, 224)
+    print(m(x).shape)  # should be (2, 5)
