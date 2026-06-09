@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
-from torch.cuda.amp import GradScaler, autocast
+import torch.amp
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -80,7 +80,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: torch.nn.Module,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     accumulation_steps: int = 1,
     grad_clip: float = 1.0,
@@ -94,7 +94,7 @@ def train_one_epoch(
 
     for step, batch in enumerate(loader, start=1):
         images, labels = _step_batch(model, batch, device)
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             logits = model(images)
             loss = criterion(logits, labels) / max(1, accumulation_steps)
 
@@ -130,7 +130,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, criterion: torch.nn.Mod
 
     for batch in loader:
         images, labels = _step_batch(model, batch, device)
-        with autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             logits = model(images)
             loss = criterion(logits, labels)
             probs = torch.softmax(logits, dim=1)
@@ -220,7 +220,7 @@ def fit_single_split(args) -> Dict[str, object]:
     )
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
-    scaler = GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     state = TrainState(epoch=0, best_val_loss=float("inf"), best_val_f1=0.0, best_val_acc=0.0, history=[])
     patience_counter = 0
@@ -301,7 +301,7 @@ def fit_kfold(args) -> Dict[str, object]:
         )
         optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
-        scaler = GradScaler(enabled=args.amp and device.type == "cuda")
+        scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
         best_val_f1 = 0.0
         best_val_loss = float("inf")
