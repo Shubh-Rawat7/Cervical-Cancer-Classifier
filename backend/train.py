@@ -16,7 +16,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import StratifiedKFold
 import torch.amp
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import DataLoader
 
 from config import CLASS_NAMES, DEFAULTS, DEFAULT_IMAGE_SIZE, CHECKPOINT_DIR, MODEL_PATH, NUM_CLASSES
@@ -42,6 +42,17 @@ def seed_everything(seed: int = DEFAULTS.seed) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def _get_warmup_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
+    """Create a learning rate scheduler with linear warmup followed by cosine annealing."""
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch) / float(max(1, warmup_epochs))
+        progress = float(epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return LambdaLR(optimizer, lr_lambda)
 
 
 def _build_loader(samples: Sequence[ImageRecord], batch_size: int, image_size: int, shuffle: bool, num_workers: int, transform=None) -> DataLoader:
@@ -219,7 +230,7 @@ def fit_single_split(args) -> Dict[str, object]:
         label_smoothing=args.label_smoothing,
     )
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
+    scheduler = _get_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
     scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     state = TrainState(epoch=0, best_val_loss=float("inf"), best_val_f1=0.0, best_val_acc=0.0, history=[])
@@ -300,7 +311,7 @@ def fit_kfold(args) -> Dict[str, object]:
             label_smoothing=args.label_smoothing,
         )
         optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.min_lr)
+        scheduler = _get_warmup_scheduler(optimizer, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
         scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
         best_val_f1 = 0.0
@@ -385,6 +396,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-smoothing", type=float, default=DEFAULTS.label_smoothing)
     parser.add_argument("--lr", type=float, default=DEFAULTS.lr)
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--warmup-epochs", type=int, default=DEFAULTS.warmup_epochs)
     parser.add_argument("--weight-decay", type=float, default=DEFAULTS.weight_decay)
     parser.add_argument("--grad-clip", type=float, default=DEFAULTS.grad_clip)
     parser.add_argument("--accumulation-steps", type=int, default=DEFAULTS.accumulation_steps)

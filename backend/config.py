@@ -47,9 +47,9 @@ BACKBONE_ALIASES = {
 class TrainDefaults:
 	epochs: int = 90
 	batch_size: int = 16
-	lr: float = 5e-5
+	lr: float = 1e-5
 	weight_decay: float = 1e-4
-	warmup_epochs: int = 5
+	warmup_epochs: int = 10
 	patience: int = 15
 	grad_clip: float = 1.0
 	accumulation_steps: int = 2
@@ -58,7 +58,7 @@ class TrainDefaults:
 	test_split: float = 0.0
 	seed: int = 42
 	loss_type: str = "class_balanced_focal"
-	gamma: float = 2.0
+	gamma: float = 1.5
 	beta: float = 0.9999
 	label_smoothing: float = 0.05
 	image_size: int = DEFAULT_IMAGE_SIZE
