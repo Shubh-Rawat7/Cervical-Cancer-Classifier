@@ -1,0 +1,45 @@
+# backend/requirements.txt
+# ─────────────────────────────────────────────────────────────────
+# AUDITED & UPDATED — pins added for reproducibility
+# Original requirements had no version pins (reproducibility bug)
+# ─────────────────────────────────────────────────────────────────
+
+# ── Deep learning ─────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# ── Computer vision ────────────────────────────────────────────────
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0
+scikit-image>=0.21.0
+ImageHash>=4.3.1          # for perceptual duplicate detection
+albumentations>=1.4.0
+
+# ── ML & metrics ──────────────────────────────────────────────────
+scikit-learn>=1.3.0
+numpy>=1.24.0
+scipy>=1.11.0
+timm>=0.9.16
+
+# ── Data & utilities ──────────────────────────────────────────────
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.66.0
+
+# ── API ────────────────────────────────────────────────────────────
+fastapi>=0.103.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# ── Optional: Mamba backbone acceleration ─────────────────────────
+# mamba-ssm>=2.2.0
+
+# ── Explainability ────────────────────────────────────────────────
+# SHAP (optional, install separately if needed):
+# shap>=0.42.0
+
+# ── Reproducibility & dev ─────────────────────────────────────────
+python-dotenv>=1.0.0
