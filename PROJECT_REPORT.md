@@ -114,6 +114,24 @@ Training augmentation includes:
 - affine transforms
 - CLAHE and median blur
 
+### 4.4 Activation functions and training defaults
+
+The model supports multiple activation functions exposed as a configuration option. The default activation and core training defaults are defined in `backend/config.py` and summarized below:
+
+- **Supported activations:** `SiLU` (default), `GELU`, `Mish`
+- **Default image size:** 224 × 224
+- **Default epochs:** 90
+- **Default batch size:** 16
+- **Optimizer:** `AdamW` with weight decay 1e-4
+- **Learning rate schedule:** Cosine annealing (with warm restarts used in staged training)
+- **Mixed precision:** Enabled by default (`torch.amp`)
+- **Gradient clipping:** Max norm 1.0
+- **Accumulation steps:** 2 (configurable)
+- **Class weighting / loss:** `FocalLoss` with class-balanced weights; evaluation uses class-weighted cross-entropy where appropriate
+- **Augmentation helpers:** MixUp is supported (default alpha ~0.3) and can be enabled in the training script; CutMix hooks may also be present in experimental branches
+
+These defaults can be adjusted via the training script or by editing `backend/config.py` for reproducible experiments.
+
 ## 5. Inference and Deployment
 
 ### 5.1 Inference utility
@@ -175,3 +193,30 @@ The API loads a configured model checkpoint and returns predicted probabilities 
 ## 9. Conclusions
 
 This project provides a focused Herlev cervical cell classification pipeline with a modern training stack, TTA-enabled inference, and FastAPI deployment support.
+
+## 10. Results & Metrics (to populate)
+
+Populate this section with measured results from your training runs. Do not edit metric names — use the exact fields listed below so the project artifacts remain consistent.
+
+- Overall accuracy: **--%**
+- Validation balanced accuracy: **--%**
+- Per-class precision / recall / F1 (Normal, CIN1, CIN2, CIN3, Cancer): **--**
+- Confusion matrix: see `artifacts/confusion_matrix.png` (or a textual matrix below)
+
+How to produce these metrics:
+
+1. Run training and ensure `backend/train.py` writes a `history.json` or `metrics.json` into the output directory (example run):
+
+```bash
+python backend/train.py --data-dir /path/to/dataset --output-dir ./Checkpoints --epochs 90
+```
+
+2. If no metrics files are written, run the evaluation helper against the validation set (example):
+
+```bash
+python backend/scripts/evaluate_test.py --model ./Checkpoints/best_model.pt --data-dir /path/to/dataset/val --output ./artifacts/metrics.json
+```
+
+3. Use `scikit-learn` to generate a `classification_report` and `confusion_matrix` from saved predictions, then paste the numeric outputs into the fields above.
+
+If you prefer, share the `Checkpoints/history.json` or `artifacts/metrics.json` and I will extract the numbers and update this report for you.

@@ -72,3 +72,44 @@ flowchart TD
 
 - The repository currently supports five class labels: Normal, CIN1, CIN2, CIN3, Cancer.
 - Training expects a directory layout with `train/` and `val/` class subfolders.
+
+## Results & Metrics
+
+This section should be populated with the results from your training runs. Below are the recommended metrics to report and commands to reproduce them.
+
+- **Recommended metrics:** overall accuracy, balanced accuracy, per-class precision/recall/F1, confusion matrix, and ROC/AUC where applicable.
+- **Placeholders:** Replace the values below with your measured results from `history.json` / `metrics.json` produced by `backend/train.py`.
+
+Example (replace with real numbers):
+
+- Overall accuracy: **--%**
+- Validation balanced accuracy: **--%**
+- Per-class recall (Normal, CIN1, CIN2, CIN3, Cancer): **--, --, --, --, --**
+
+How to generate metrics locally:
+
+1. Train (example):
+
+```bash
+python backend/train.py --data-dir /path/to/dataset --output-dir ./Checkpoints --epochs 90
+```
+
+2. If `backend/train.py` writes `history.json` or `metrics.json` into the output directory, open those files to copy results into this section. If not, compute metrics by running the evaluation script against the validation folder:
+
+```bash
+python backend/scripts/evaluate_test.py --model ./Checkpoints/best_model.pt --data-dir /path/to/dataset/val --output ./artifacts/metrics.json
+```
+
+3. Generate a confusion matrix and per-class report using the saved predictions (example using scikit-learn):
+
+```python
+from sklearn.metrics import classification_report, confusion_matrix
+import json
+
+preds = ...  # load predicted labels
+labels = ... # load true labels
+print(classification_report(labels, preds, target_names=['Normal','CIN1','CIN2','CIN3','Cancer']))
+print(confusion_matrix(labels, preds))
+```
+
+Add the final numbers back into this file and into `PROJECT_REPORT.md` for the formal report.
