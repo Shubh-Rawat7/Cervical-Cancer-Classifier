@@ -22,6 +22,17 @@ from PIL import Image
 from models.cnn_model import build_model
 from utils.transforms import tta_transforms, val_transform
 
+
+def _extract_state_dict(checkpoint: object) -> dict:
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "ema_state_dict"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+            return checkpoint
+    raise TypeError("Checkpoint does not contain a compatible state_dict")
+
 CLASS_NAMES = ["Normal", "CIN1", "CIN2", "CIN3", "Cancer"]
 
 
@@ -39,8 +50,9 @@ class CervicalInference:
         self.use_tta = use_tta
         self.transforms = tta_transforms() if use_tta else [val_transform()]
         self.model = build_model(num_classes=num_classes)
-        state = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(state)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        state = _extract_state_dict(checkpoint)
+        self.model.load_state_dict(state, strict=False)
         self.model.to(self.device)
         self.model.eval()
 

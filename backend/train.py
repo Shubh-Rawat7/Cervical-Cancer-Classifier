@@ -10,8 +10,10 @@ Writes to output-dir:
 import argparse
 import json
 import os
+import random
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -31,6 +33,19 @@ from sklearn.preprocessing import label_binarize
 from models.cnn_model import build_model
 
 
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+set_seed(42)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Focal Loss
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,6 +62,33 @@ class FocalLoss(nn.Module):
         )
         pt = torch.exp(-ce)
         return (((1 - pt) ** self.gamma) * ce).mean()
+
+
+def save_checkpoint(model, path: str | os.PathLike, extra_config: dict[str, Any] | None = None):
+    payload = {
+        "state_dict": model.state_dict(),
+        "config": {
+            "backbone": getattr(model, "backbone_name", "tf_efficientnetv2_s"),
+            "num_classes": getattr(model, "num_classes", NUM_CLASSES),
+            "image_size": getattr(model, "image_size", 224),
+            "class_names": CLASS_NAMES,
+            **(extra_config or {}),
+        },
+        "class_names": CLASS_NAMES,
+    }
+    torch.save(payload, str(path))
+
+
+def load_checkpoint_state_dict(path: str | os.PathLike):
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "ema_state_dict"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+            return checkpoint
+    raise ValueError(f"Unsupported checkpoint format: {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -114,25 +156,39 @@ def get_class_weights(dataset, device):
     return torch.tensor(weights, dtype=torch.float32).to(device)
 
 
-def load_datasets(data_dir: str, img_size: int = 224, val_frac: float = 0.20):
+def load_datasets(data_dir: str, img_size: int = 224, val_frac: float = 0.20, val_dir: str | None = None):
     """
-    Supports three layouts:
+    Supports layouts:
       A) data_dir/train/ + data_dir/val/  → use pre-split as-is
-      B) data_dir/train/ only             → stratified split
-      C) data_dir/ has class folders      → stratified split
+      B) data_dir/train/ + data_dir/test/ → use test/ as validation
+      C) data_dir/train/ only             → stratified split
+      D) data_dir/ has class folders      → stratified split
     """
     train_dir = os.path.join(data_dir, "train")
-    val_dir   = os.path.join(data_dir, "val")
+    default_val_dir = os.path.join(data_dir, "val")
+    fallback_test_dir = os.path.join(data_dir, "test")
 
-    if os.path.isdir(train_dir) and os.path.isdir(val_dir):
+    if val_dir is not None and os.path.isdir(val_dir):
+        print(f"Layout A: explicit validation directory '{val_dir}'")
+        train_ds = datasets.ImageFolder(train_dir, transform=get_transforms("train", img_size))
+        val_ds = datasets.ImageFolder(val_dir, transform=get_transforms("val", img_size))
+        train_ds.targets = list(train_ds.targets)
+        val_ds.targets = list(val_ds.targets)
+    elif os.path.isdir(train_dir) and os.path.isdir(default_val_dir):
         print("Layout A: pre-split (train/ + val/)")
         train_ds = datasets.ImageFolder(train_dir, transform=get_transforms("train", img_size))
-        val_ds   = datasets.ImageFolder(val_dir,   transform=get_transforms("val",   img_size))
+        val_ds = datasets.ImageFolder(default_val_dir, transform=get_transforms("val", img_size))
         train_ds.targets = list(train_ds.targets)
-        val_ds.targets   = list(val_ds.targets)
+        val_ds.targets = list(val_ds.targets)
+    elif os.path.isdir(train_dir) and os.path.isdir(fallback_test_dir):
+        print("Layout B: using 'test/' as validation set")
+        train_ds = datasets.ImageFolder(train_dir, transform=get_transforms("train", img_size))
+        val_ds = datasets.ImageFolder(fallback_test_dir, transform=get_transforms("val", img_size))
+        train_ds.targets = list(train_ds.targets)
+        val_ds.targets = list(val_ds.targets)
     else:
         source_dir = train_dir if os.path.isdir(train_dir) else data_dir
-        print(f"Layout B/C: stratified {val_frac:.0%} split from '{source_dir}'")
+        print(f"Layout C/D: stratified {val_frac:.0%} split from '{source_dir}'")
 
         full_ds = datasets.ImageFolder(source_dir, transform=get_transforms("train", img_size))
         targets = np.array(full_ds.targets)
@@ -144,7 +200,7 @@ def load_datasets(data_dir: str, img_size: int = 224, val_frac: float = 0.20):
         train_ds.targets = targets[train_idx].tolist()
 
         val_base = datasets.ImageFolder(source_dir, transform=get_transforms("val", img_size))
-        val_ds   = Subset(val_base, val_idx)
+        val_ds = Subset(val_base, val_idx)
         val_ds.targets = targets[val_idx].tolist()
 
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
@@ -276,7 +332,7 @@ def run_phase(model, train_loader, val_loader, optimizer, scheduler,
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
-            torch.save(model.state_dict(), best_ckpt_path)
+            save_checkpoint(model, best_ckpt_path, {"phase": "best", "epoch": global_ep})
             print(f"    ✓ Best saved (bal_acc={best_bal_acc:.4f})")
             patience_counter = 0
         else:
@@ -294,20 +350,23 @@ def run_phase(model, train_loader, val_loader, optimizer, scheduler,
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir",       default="../data")
-    p.add_argument("--output-dir",     default="./checkpoints")
-    p.add_argument("--epochs",         type=int,   default=90)
-    p.add_argument("--batch-size",     type=int,   default=32)
-    p.add_argument("--img-size",       type=int,   default=224)
-    p.add_argument("--lr-head",        type=float, default=3e-4)
-    p.add_argument("--lr-backbone",    type=float, default=3e-5)
-    p.add_argument("--phase1-epochs",  type=int,   default=20)
-    p.add_argument("--phase2-epochs",  type=int,   default=20)
-    p.add_argument("--num-workers",    type=int,   default=2)
-    p.add_argument("--focal-gamma",    type=float, default=2.0)
-    p.add_argument("--mixup-alpha",    type=float, default=0.3)
-    p.add_argument("--patience",       type=int,   default=15)
-    p.add_argument("--val-frac",       type=float, default=0.20)
+    p.add_argument("--data-dir", default="../Herlev Dataset")
+    p.add_argument("--output-dir", default="./Checkpoints")
+    p.add_argument("--epochs", type=int, default=90)
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--img-size", type=int, default=224)
+    p.add_argument("--lr-head", type=float, default=3e-4)
+    p.add_argument("--lr-backbone", type=float, default=3e-5)
+    p.add_argument("--phase1-epochs", type=int, default=24)
+    p.add_argument("--phase2-epochs", type=int, default=26)
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--focal-gamma", type=float, default=1.5)
+    p.add_argument("--mixup-alpha", type=float, default=0.30)
+    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--val-frac", type=float, default=0.20)
+    p.add_argument("--val-dir", default=None)
+    p.add_argument("--backbone", default="tf_efficientnetv2_m")
+    p.add_argument("--dropout", type=float, default=0.30)
     return p.parse_args()
 
 
@@ -315,10 +374,12 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
     print(f"Device: {device}")
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_ds, val_ds = load_datasets(args.data_dir, args.img_size, args.val_frac)
+    train_ds, val_ds = load_datasets(args.data_dir, args.img_size, args.val_frac, args.val_dir)
     sampler = build_weighted_sampler(train_ds)
 
     train_loader = DataLoader(
@@ -331,15 +392,20 @@ def main():
     )
 
     # ── Model + loss ──────────────────────────────────────────────────────────
-    model          = build_model(num_classes=NUM_CLASSES).to(device)
+    model          = build_model(
+        num_classes=NUM_CLASSES,
+        backbone_name=args.backbone,
+        dropout=args.dropout,
+    ).to(device)
     class_weights  = get_class_weights(train_ds, device)
     criterion      = FocalLoss(gamma=args.focal_gamma, weight=class_weights)
     val_criterion  = nn.CrossEntropyLoss(weight=class_weights)
     scaler         = GradScaler()
 
     best_bal_acc   = 0.0
-    best_ckpt_path = os.path.join(args.output_dir, "best_model.pth")
-    history        = []          # ← written to history.json after each phase
+    best_ckpt_path = os.path.join(args.output_dir, "best_model.pt")
+    last_ckpt_path = os.path.join(args.output_dir, "last_model.pt")
+    history        = []
     epoch_offset   = 0
 
     def _save_history():
@@ -366,6 +432,7 @@ def main():
         epoch_offset=epoch_offset, mixup_alpha=args.mixup_alpha,
         skip_mixup_epochs=3,
     )
+    save_checkpoint(model, last_ckpt_path, {"phase": "phase1", "epoch": epoch_offset})
     _save_history()
 
     # ── Phase 2: unfreeze last 3 blocks ──────────────────────────────────────
@@ -374,7 +441,7 @@ def main():
     print(f"PHASE 2 — Unfreeze last 3 blocks ({p2} epochs, backbone_lr={args.lr_backbone:.2e})")
     print(f"{'='*60}")
 
-    model.load_state_dict(torch.load(best_ckpt_path))
+    model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
     model.unfreeze_backbone(unfreeze_last_n_blocks=3)
     optimizer = optim.AdamW([
         {"params": filter(lambda p: p.requires_grad, model.backbone.parameters()),
@@ -392,6 +459,7 @@ def main():
         best_ckpt_path=best_ckpt_path, history=history,
         epoch_offset=epoch_offset, mixup_alpha=args.mixup_alpha,
     )
+    save_checkpoint(model, last_ckpt_path, {"phase": "phase2", "epoch": epoch_offset})
     _save_history()
 
     # ── Phase 3: full fine-tune ───────────────────────────────────────────────
@@ -401,7 +469,7 @@ def main():
         print(f"PHASE 3 — Full fine-tune ({remaining} epochs, lr={args.lr_backbone/3:.2e})")
         print(f"{'='*60}")
 
-        model.load_state_dict(torch.load(best_ckpt_path))
+        model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
         model.unfreeze_all()
         optimizer = optim.AdamW(
             model.parameters(), lr=args.lr_backbone / 3, weight_decay=1e-4,
@@ -417,14 +485,17 @@ def main():
             epoch_offset=epoch_offset, mixup_alpha=args.mixup_alpha,
             mixup_scale=0.5,
         )
+        save_checkpoint(model, last_ckpt_path, {"phase": "phase3", "epoch": epoch_offset})
         _save_history()
+
+    save_checkpoint(model, last_ckpt_path, {"phase": "final", "epoch": epoch_offset})
 
     # ── Final evaluation + write metrics.json ─────────────────────────────────
     print(f"\n{'='*60}")
     print(f"FINAL EVALUATION  (best val balanced_accuracy = {best_bal_acc:.4f})")
     print(f"{'='*60}")
 
-    model.load_state_dict(torch.load(best_ckpt_path))
+    model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
     _, val_acc, bal_acc, val_f1, val_auc, preds, labels = eval_epoch(
         model, val_loader, val_criterion, device,
     )

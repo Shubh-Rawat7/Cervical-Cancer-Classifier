@@ -41,13 +41,14 @@ class CervicalClassifier(nn.Module):
     NUM_CLASSES = 5
     BACKBONE_OUT = 1280  # EfficientNetV2-S final feature dim
 
-    def __init__(self, num_classes: int = 5, dropout: float = 0.4):
+    def __init__(self, num_classes: int = 5, dropout: float = 0.4, backbone_name: str = "tf_efficientnetv2_s"):
         super().__init__()
         self.num_classes = num_classes
+        self.backbone_name = backbone_name
 
         # Pretrained backbone — features only (no classifier)
         self.backbone = timm.create_model(
-            "tf_efficientnetv2_s",
+            backbone_name,
             pretrained=True,
             num_classes=0,   # remove timm head
             global_pool="",  # remove global pool so we get spatial features
@@ -98,8 +99,8 @@ class CervicalClassifier(nn.Module):
         return self.head(feat)
 
 
-def build_model(num_classes: int = 5, dropout: float = 0.4) -> CervicalClassifier:
-    return CervicalClassifier(num_classes=num_classes, dropout=dropout)
+def build_model(num_classes: int = 5, dropout: float = 0.4, backbone_name: str = "tf_efficientnetv2_s") -> CervicalClassifier:
+    return CervicalClassifier(num_classes=num_classes, dropout=dropout, backbone_name=backbone_name)
 
 
 if __name__ == "__main__":
