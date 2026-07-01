@@ -1,8 +1,4 @@
-"""
-utils/transforms.py — Shared transform definitions + TTA (Test-Time Augmentation).
-
-Import from here so train.py, inference, and API all use identical pipelines.
-"""
+"""Shared transform definitions and eight-view TTA pipelines."""
 
 from torchvision import transforms
 from torchvision.transforms import RandAugment
@@ -38,7 +34,7 @@ def val_transform(img_size: int = IMG_SIZE) -> transforms.Compose:
 
 def tta_transforms(img_size: int = IMG_SIZE) -> list:
     """
-    Returns a list of 6 deterministic transforms for Test-Time Augmentation.
+    Returns a list of 8 deterministic transforms for Test-Time Augmentation.
     Average predictions across all transforms for better robustness.
     """
     base = [
@@ -75,6 +71,18 @@ def tta_transforms(img_size: int = IMG_SIZE) -> list:
         transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.RandomRotation((180, 180)),
+            transforms.ToTensor(),
+            transforms.Normalize(MEAN, STD),
+        ]),
+        transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomRotation((270, 270)),
+            transforms.ToTensor(),
+            transforms.Normalize(MEAN, STD),
+        ]),
+        transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.02),
             transforms.ToTensor(),
             transforms.Normalize(MEAN, STD),
         ]),

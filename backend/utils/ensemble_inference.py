@@ -15,7 +15,7 @@ from torchvision.datasets import ImageFolder
 
 from config import CLASS_NAMES, DEFAULT_IMAGE_SIZE
 from dataset import build_eval_transform, build_tta_transforms
-from models.model import get_class_names, load_model
+from models.hybrid_model import get_class_names, load_model
 
 
 def load_checkpoint_model(checkpoint_path: str | Path, device: torch.device):

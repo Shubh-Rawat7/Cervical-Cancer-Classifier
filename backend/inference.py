@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from models.cnn_model import build_model
+from models.hybrid_model import build_model
 from utils.transforms import tta_transforms, val_transform
 
 
@@ -114,7 +114,9 @@ try:
     class CervicalGradCAM:
         def __init__(self, inference: CervicalInference):
             self.inference = inference
-            target_layer = inference.model.backbone.blocks[-1]
+            backbone = inference.model.backbone
+            blocks = getattr(backbone, "blocks", None)
+            target_layer = list(blocks)[-1] if blocks else list(backbone.children())[-1]
             self.cam = GradCAM(
                 model=inference.model,
                 target_layers=[target_layer],

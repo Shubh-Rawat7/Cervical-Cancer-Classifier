@@ -190,10 +190,10 @@ def find_mislabeled_samples(data_dir: str, model_checkpoint: str,
     """
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from models.cnn_model import CervicalCancerCNN
+    from models.hybrid_model import HerlevHybridClassifier
 
     device = torch.device(device_str)
-    model = CervicalCancerCNN(num_classes=5)
+    model = HerlevHybridClassifier(num_classes=5, pretrained=False)
     model.load_state_dict(torch.load(model_checkpoint, map_location=device))
     model.eval().to(device)
 
