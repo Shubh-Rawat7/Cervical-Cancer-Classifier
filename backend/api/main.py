@@ -24,7 +24,7 @@ for path in (_HERE, _BACKEND, _PROJECT):
 
 from config import CLASS_NAMES, DEFAULT_IMAGE_SIZE, MODEL_PATH
 from dataset import build_eval_transform
-from models.hybrid_model import get_class_names, load_model
+from models.model import get_class_names, load_model
 
 
 app = FastAPI(title="Herlev Cervical Cell Classification API")

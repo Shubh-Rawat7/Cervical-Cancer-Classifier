@@ -2,54 +2,13 @@
 train.py — Production training script for Cervical Cancer Classifier.
 
 Writes to output-dir:
-  • best_model.pt    — best checkpoint (EMA weights) by smoothed val balanced accuracy
-  • last_model.pt     — last checkpoint of each phase
-  • history.json      — per-epoch metrics (consumed by Cell 7)
-  • metrics.json       — final confusion matrix + classification report (Cell 7)
-
-CHANGES vs. the previous version (see accompanying notes for why):
-  1. Imbalance is corrected ONCE, not twice. We keep the WeightedRandomSampler
-     (structural rebalancing at the data level) and DROP the extra inverse-
-     frequency class weighting inside the loss by default. Stacking both was
-     causing huge gradient variance on minority-class batches — this is the
-     single biggest driver of the epoch-to-epoch accuracy swings you saw in
-     history.json (e.g. train_acc 53.6% -> 34.2% between epoch 3 and 4).
-     You can still turn loss-weighting back on with --use-loss-weighting if
-     you want to A/B test it.
-  2. Softer, domain-appropriate augmentation. RandAugment(magnitude=9) +
-     heavy ColorJitter + RandomErasing + MixUp, all stacked, was almost
-     certainly washing out the fine nuclear/chromatin texture that separates
-     CIN1/CIN2/CIN3 — classes that are already the hardest, most ambiguous
-     boundary in cervical cytology. RandAugment is removed; jitter/erasing
-     are much gentler.
-  3. MixUp is now probabilistic (applied to a fraction of batches, not
-     every batch) and is disabled entirely in Phase 3 (full fine-tune) so
-     the model gets a chance to converge on real, non-blended images at
-     the end of training.
-  4. Warmup + single-cycle cosine LR schedule instead of
-     CosineAnnealingWarmRestarts with no warmup — reduces early-training
-     instability, especially for the higher head LR.
-  5. Exponential Moving Average (EMA) of model weights. We evaluate AND
-     checkpoint using the EMA model, not the raw (noisy) weights. On a
-     274-sample validation set, single-epoch balanced accuracy is a noisy
-     signal; EMA acts as a low-pass filter over the last N epochs of
-     weights, so "best" checkpoints are far less likely to be a lucky
-     epoch that will not generalize.
-  6. Default backbone switched to tf_efficientnetv2_s (matches the model
-     docstring) — the larger -m backbone was overfitting/underfitting
-     erratically on a dataset this size. Still fully configurable.
-  7. Gradient accumulation (default 2 steps) for a more stable effective
-     batch size without more GPU memory.
-
-Everything else (data-layout autodetection, checkpoint format, metrics.json
-schema, CLI flags you already use) is preserved so the rest of your
-pipeline / Kaggle notebook / Cell 7 does not need to change.
+  • best_model.pth   — best checkpoint by val balanced accuracy
+  • history.json     — per-epoch metrics (consumed by Cell 7)
+  • metrics.json     — final confusion matrix + classification report (Cell 7)
 """
 
 import argparse
-import copy
 import json
-import math
 import os
 import random
 import time
@@ -59,11 +18,11 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 from torchvision import datasets, transforms
+from torchvision.transforms import RandAugment
 from sklearn.metrics import (
     balanced_accuracy_score, classification_report,
     confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score,
@@ -88,49 +47,21 @@ set_seed(42)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Focal Loss (with optional label smoothing, optional class weighting)
+# Focal Loss
 # ──────────────────────────────────────────────────────────────────────────────
 
 class FocalLoss(nn.Module):
-    """
-    Focal loss with soft targets so label smoothing composes cleanly with it.
-    weight=None by default — imbalance is handled by the sampler instead
-    (see module docstring, point 1). Pass a weight tensor to re-enable
-    class weighting inside the loss if you explicitly want to test it.
-    """
-
-    def __init__(self, gamma: float = 2.0, weight=None, label_smoothing: float = 0.0):
+    def __init__(self, gamma: float = 2.0, weight=None):
         super().__init__()
         self.gamma = gamma
-        self.label_smoothing = label_smoothing
-        self.register_buffer("weight", weight.clone().float() if weight is not None else None,
-                              persistent=False)
+        self.weight = weight
 
     def forward(self, logits, targets):
-        num_classes = logits.size(-1)
-        if targets.dim() == 1:  # hard integer labels
-            hard = F.one_hot(targets.long(), num_classes=num_classes).float()
-            if self.label_smoothing > 0:
-                target_probs = hard * (1.0 - self.label_smoothing) + self.label_smoothing / num_classes
-            else:
-                target_probs = hard
-            hard_idx = targets.long()
-        else:  # already soft (e.g. mixup-blended) targets
-            target_probs = targets.float()
-            hard_idx = target_probs.argmax(dim=-1)
-
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = log_probs.exp()
-        ce = -(target_probs * log_probs).sum(dim=-1)
-        pt = (target_probs * probs).sum(dim=-1).clamp_min(1e-8)
-        loss = (1.0 - pt).pow(self.gamma) * ce
-
-        if self.weight is not None:
-            w = self.weight.to(logits.device)
-            sample_w = w[hard_idx]
-            loss = loss * sample_w
-
-        return loss.mean()
+        ce = nn.functional.cross_entropy(
+            logits, targets, weight=self.weight, reduction="none"
+        )
+        pt = torch.exp(-ce)
+        return (((1 - pt) ** self.gamma) * ce).mean()
 
 
 def save_checkpoint(model, path: str | os.PathLike, extra_config: dict[str, Any] | None = None):
@@ -161,43 +92,10 @@ def load_checkpoint_state_dict(path: str | os.PathLike):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# EMA (Exponential Moving Average) of model weights
+# MixUp
 # ──────────────────────────────────────────────────────────────────────────────
 
-class ModelEMA:
-    """
-    Keeps a shadow copy of the model whose weights are an exponential moving
-    average of the trained weights. We evaluate + checkpoint against this
-    shadow model instead of the raw model, because it is far less sensitive
-    to any single noisy epoch — important on a ~1.4k-image dataset with a
-    274-sample validation split, where a single epoch's balanced accuracy
-    can easily swing several points from noise alone.
-    """
-
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.ema = copy.deepcopy(model).eval()
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-        self.decay = decay
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        msd = model.state_dict()
-        for k, v in self.ema.state_dict().items():
-            if v.dtype.is_floating_point:
-                v.copy_(v * self.decay + (1.0 - self.decay) * msd[k].detach())
-            else:
-                v.copy_(msd[k])
-
-    def state_dict(self):
-        return self.ema.state_dict()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MixUp (probabilistic — not applied to every batch)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def mixup_data(x, y, alpha=0.2, device="cuda"):
+def mixup_data(x, y, alpha=0.3, device="cuda"):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     idx = torch.randperm(x.size(0)).to(device)
     return lam * x + (1 - lam) * x[idx], y, y[idx], lam
@@ -212,32 +110,25 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 # ──────────────────────────────────────────────────────────────────────────────
 
 CLASS_NAMES = ["Normal", "CIN1", "CIN2", "CIN3", "Cancer"]
-NUM_CLASSES = len(CLASS_NAMES)
+NUM_CLASSES  = len(CLASS_NAMES)
 
 
 def get_transforms(phase: str, img_size: int = 224):
-    """
-    Gentler than before. Cervical cytology grading depends on subtle
-    chromatin texture / nuclear-cytoplasm ratio cues — RandAugment at
-    magnitude 9, strong ColorJitter, and RandomErasing were almost
-    certainly destroying exactly the signal needed to separate CIN1/CIN2/
-    CIN3. Flips + mild rotation are still safe (microscopy fields have no
-    canonical "up"), color/erasing are toned down substantially.
-    """
     mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
+    std  = [0.229, 0.224, 0.225]
     if phase == "train":
         return transforms.Compose([
-            transforms.Resize((img_size + 16, img_size + 16)),
+            transforms.Resize((img_size + 32, img_size + 32)),
             transforms.RandomCrop(img_size),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15,
-                                    saturation=0.10, hue=0.02),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3,
+                                   saturation=0.2, hue=0.05),
+            RandAugment(num_ops=2, magnitude=9),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
-            transforms.RandomErasing(p=0.10, scale=(0.02, 0.08)),
+            transforms.RandomErasing(p=0.2),
         ])
     else:
         return transforms.Compose([
@@ -258,9 +149,8 @@ def build_weighted_sampler(dataset):
 
 
 def get_class_weights(dataset, device):
-    """Only used if --use-loss-weighting is passed explicitly."""
     targets = np.array(dataset.targets)
-    counts = np.bincount(targets, minlength=NUM_CLASSES).astype(float)
+    counts  = np.bincount(targets, minlength=NUM_CLASSES).astype(float)
     weights = 1.0 / (counts + 1e-6)
     weights = weights / weights.sum() * NUM_CLASSES
     return torch.tensor(weights, dtype=torch.float32).to(device)
@@ -322,62 +212,38 @@ def load_datasets(data_dir: str, img_size: int = 224, val_frac: float = 0.20, va
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LR schedule: linear warmup -> single-cycle cosine decay
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_scheduler(optimizer, total_epochs: int, warmup_epochs: int = 3, min_lr_ratio: float = 0.02):
-    warmup_epochs = min(warmup_epochs, max(total_epochs - 1, 0))
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / max(1, warmup_epochs)
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        progress = min(max(progress, 0.0), 1.0)
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
-
-    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Training / eval loops
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimizer, criterion, scaler, device, ema: ModelEMA,
-                 mixup_prob=0.3, mixup_alpha=0.2, accum_steps=2):
+def train_epoch(model, loader, optimizer, criterion, scaler, device,
+                use_mixup=True, mixup_alpha=0.3):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    optimizer.zero_grad()
 
-    n_batches = len(loader)
-    for i, (imgs, labels) in enumerate(loader):
+    for imgs, labels in loader:
         imgs, labels = imgs.to(device), labels.to(device)
-        use_mixup = mixup_prob > 0 and random.random() < mixup_prob
+        optimizer.zero_grad()
 
         if use_mixup:
             mixed, y_a, y_b, lam = mixup_data(imgs, labels, alpha=mixup_alpha, device=device)
             with autocast():
                 logits = model(mixed)
-                loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+                loss   = mixup_criterion(criterion, logits, y_a, y_b, lam)
         else:
             with autocast():
                 logits = model(imgs)
-                loss = criterion(logits, labels)
+                loss   = criterion(logits, labels)
 
-        scaler.scale(loss / accum_steps).backward()
-
-        is_last_batch = (i == n_batches - 1)
-        if (i + 1) % accum_steps == 0 or is_last_batch:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            ema.update(model)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item() * imgs.size(0)
-        preds = logits.argmax(dim=1)
-        correct += preds.eq(labels).sum().item()
-        total += imgs.size(0)
+        preds       = logits.argmax(dim=1)
+        correct    += preds.eq(labels).sum().item()
+        total      += imgs.size(0)
 
     return total_loss / total, correct / total
 
@@ -392,13 +258,13 @@ def eval_epoch(model, loader, criterion, device):
         imgs, labels = imgs.to(device), labels.to(device)
         with autocast():
             logits = model(imgs)
-            loss = criterion(logits, labels)
+            loss   = criterion(logits, labels)
 
-        probs = torch.softmax(logits, dim=1)
-        preds = logits.argmax(dim=1)
+        probs  = torch.softmax(logits, dim=1)
+        preds  = logits.argmax(dim=1)
         total_loss += loss.item() * imgs.size(0)
-        correct += preds.eq(labels).sum().item()
-        total += imgs.size(0)
+        correct    += preds.eq(labels).sum().item()
+        total      += imgs.size(0)
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
         all_probs.extend(probs.cpu().tolist())
@@ -406,9 +272,10 @@ def eval_epoch(model, loader, criterion, device):
     bal_acc = balanced_accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
+    # AUC-ROC (macro OvR) — only if all classes present
     try:
         y_bin = label_binarize(all_labels, classes=list(range(NUM_CLASSES)))
-        auc = roc_auc_score(y_bin, np.array(all_probs), multi_class="ovr", average="macro")
+        auc   = roc_auc_score(y_bin, np.array(all_probs), multi_class="ovr", average="macro")
     except Exception:
         auc = float("nan")
 
@@ -423,50 +290,50 @@ def eval_epoch(model, loader, criterion, device):
 def run_phase(model, train_loader, val_loader, optimizer, scheduler,
               criterion, val_criterion, scaler, device, n_epochs,
               best_bal_acc, patience, best_ckpt_path, history,
-              epoch_offset, ema: ModelEMA, mixup_alpha=0.2, mixup_prob=0.3,
-              accum_steps=2):
+              epoch_offset, mixup_alpha=0.3, mixup_scale=1.0,
+              skip_mixup_epochs=0):
     patience_counter = 0
 
     for ep in range(1, n_epochs + 1):
         global_ep = epoch_offset + ep
         t0 = time.time()
 
+        use_mixup = ep > skip_mixup_epochs
         tr_loss, tr_acc = train_epoch(
-            model, train_loader, optimizer, criterion, scaler, device, ema,
-            mixup_prob=mixup_prob, mixup_alpha=mixup_alpha, accum_steps=accum_steps,
+            model, train_loader, optimizer, criterion, scaler, device,
+            use_mixup=use_mixup, mixup_alpha=mixup_alpha * mixup_scale,
         )
-        # Evaluate the EMA (shadow) model — smoother, less noise-driven signal
-        # than the raw weights, which matters a lot on a 274-sample val set.
         val_loss, val_acc, bal_acc, val_f1, val_auc, preds, labels = eval_epoch(
-            ema.ema, val_loader, val_criterion, device,
+            model, val_loader, val_criterion, device,
         )
         scheduler.step()
 
-        train_f1_approx = tr_acc  # cheap proxy; real F1 too slow per epoch
+        # train F1 approximation (use train acc as proxy, real F1 too slow per epoch)
+        train_f1_approx = tr_acc   # replace with real F1 if speed allows
 
         history.append({
-            "epoch": global_ep,
-            "train_loss": round(tr_loss, 6),
-            "val_loss": round(val_loss, 6),
-            "train_accuracy": round(tr_acc, 6),
-            "val_accuracy": round(val_acc, 6),
-            "train_f1": round(train_f1_approx, 6),
-            "val_f1": round(val_f1, 6),
-            "val_auc_roc": round(val_auc, 6) if not np.isnan(val_auc) else None,
-            "val_bal_acc": round(bal_acc, 6),
+            "epoch":          global_ep,
+            "train_loss":     round(tr_loss, 6),
+            "val_loss":       round(val_loss, 6),
+            "train_accuracy": round(tr_acc,   6),
+            "val_accuracy":   round(val_acc,   6),
+            "train_f1":       round(train_f1_approx, 6),
+            "val_f1":         round(val_f1,    6),
+            "val_auc_roc":    round(val_auc, 6) if not np.isnan(val_auc) else None,
+            "val_bal_acc":    round(bal_acc,  6),
         })
 
         elapsed = time.time() - t0
         print(f"  Ep {ep:03d}/{n_epochs} (global {global_ep}) | "
               f"TrLoss={tr_loss:.4f} TrAcc={tr_acc:.3f} | "
-              f"[EMA] ValLoss={val_loss:.4f} ValAcc={val_acc:.3f} "
+              f"ValLoss={val_loss:.4f} ValAcc={val_acc:.3f} "
               f"BalAcc={bal_acc:.3f} F1={val_f1:.3f} | "
-              f"lr={scheduler.get_last_lr()[0]:.2e} | {elapsed:.1f}s")
+              f"{elapsed:.1f}s")
 
         if bal_acc > best_bal_acc:
             best_bal_acc = bal_acc
-            save_checkpoint(ema.ema, best_ckpt_path, {"phase": "best", "epoch": global_ep, "source": "ema"})
-            print(f"    ✓ Best saved (EMA bal_acc={best_bal_acc:.4f})")
+            save_checkpoint(model, best_ckpt_path, {"phase": "best", "epoch": global_ep})
+            print(f"    ✓ Best saved (bal_acc={best_bal_acc:.4f})")
             patience_counter = 0
         else:
             patience_counter += 1
@@ -487,30 +354,19 @@ def parse_args():
     p.add_argument("--output-dir", default="./Checkpoints")
     p.add_argument("--epochs", type=int, default=90)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--accum-steps", type=int, default=2,
-                    help="Gradient accumulation steps (effective batch = batch-size * accum-steps).")
     p.add_argument("--img-size", type=int, default=224)
-    p.add_argument("--lr-head", type=float, default=1.5e-4)
-    p.add_argument("--lr-backbone", type=float, default=2e-5)
+    p.add_argument("--lr-head", type=float, default=3e-4)
+    p.add_argument("--lr-backbone", type=float, default=3e-5)
     p.add_argument("--phase1-epochs", type=int, default=24)
     p.add_argument("--phase2-epochs", type=int, default=26)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--focal-gamma", type=float, default=1.5)
-    p.add_argument("--label-smoothing", type=float, default=0.05)
-    p.add_argument("--mixup-alpha", type=float, default=0.20)
-    p.add_argument("--mixup-prob", type=float, default=0.30,
-                    help="Probability MixUp is applied to a given training batch.")
-    p.add_argument("--ema-decay", type=float, default=0.999)
-    p.add_argument("--patience", type=int, default=20)
+    p.add_argument("--mixup-alpha", type=float, default=0.30)
+    p.add_argument("--patience", type=int, default=15)
     p.add_argument("--val-frac", type=float, default=0.20)
     p.add_argument("--val-dir", default=None)
-    p.add_argument("--backbone", default="tf_efficientnetv2_s")
-    p.add_argument("--dropout", type=float, default=0.35)
-    p.add_argument("--use-loss-weighting", action="store_true",
-                    help="Also apply inverse-frequency class weights inside the loss, "
-                         "on top of the WeightedRandomSampler. Off by default — see "
-                         "module docstring point 1 for why stacking both destabilized "
-                         "the previous run.")
+    p.add_argument("--backbone", default="tf_efficientnetv2_m")
+    p.add_argument("--dropout", type=float, default=0.30)
     return p.parse_args()
 
 
@@ -528,7 +384,7 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, sampler=sampler,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size * 2, shuffle=False,
@@ -536,24 +392,21 @@ def main():
     )
 
     # ── Model + loss ──────────────────────────────────────────────────────────
-    model = build_model(
+    model          = build_model(
         num_classes=NUM_CLASSES,
         backbone_name=args.backbone,
         dropout=args.dropout,
     ).to(device)
+    class_weights  = get_class_weights(train_ds, device)
+    criterion      = FocalLoss(gamma=args.focal_gamma, weight=class_weights)
+    val_criterion  = nn.CrossEntropyLoss(weight=class_weights)
+    scaler         = GradScaler()
 
-    loss_weight = get_class_weights(train_ds, device) if args.use_loss_weighting else None
-    criterion = FocalLoss(gamma=args.focal_gamma, weight=loss_weight,
-                           label_smoothing=args.label_smoothing)
-    val_criterion = FocalLoss(gamma=args.focal_gamma, weight=None, label_smoothing=0.0)
-    scaler = GradScaler()
-    ema = ModelEMA(model, decay=args.ema_decay)
-
-    best_bal_acc = 0.0
+    best_bal_acc   = 0.0
     best_ckpt_path = os.path.join(args.output_dir, "best_model.pt")
     last_ckpt_path = os.path.join(args.output_dir, "last_model.pt")
-    history = []
-    epoch_offset = 0
+    history        = []
+    epoch_offset   = 0
 
     def _save_history():
         Path(args.output_dir, "history.json").write_text(json.dumps(history, indent=2))
@@ -568,15 +421,16 @@ def main():
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr_head, weight_decay=1e-4,
     )
-    scheduler = build_scheduler(optimizer, total_epochs=p1, warmup_epochs=min(3, p1 // 4 + 1))
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=max(p1, 1), eta_min=1e-6,
+    )
     best_bal_acc, epoch_offset = run_phase(
         model, train_loader, val_loader, optimizer, scheduler,
         criterion, val_criterion, scaler, device,
         n_epochs=p1, best_bal_acc=best_bal_acc, patience=args.patience,
         best_ckpt_path=best_ckpt_path, history=history,
-        epoch_offset=epoch_offset, ema=ema,
-        mixup_alpha=args.mixup_alpha, mixup_prob=args.mixup_prob,
-        accum_steps=args.accum_steps,
+        epoch_offset=epoch_offset, mixup_alpha=args.mixup_alpha,
+        skip_mixup_epochs=3,
     )
     save_checkpoint(model, last_ckpt_path, {"phase": "phase1", "epoch": epoch_offset})
     _save_history()
@@ -588,28 +442,27 @@ def main():
     print(f"{'='*60}")
 
     model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
-    ema = ModelEMA(model, decay=args.ema_decay)  # reset EMA to the phase-1 best, not stale phase-1 average
     model.unfreeze_backbone(unfreeze_last_n_blocks=3)
     optimizer = optim.AdamW([
         {"params": filter(lambda p: p.requires_grad, model.backbone.parameters()),
          "lr": args.lr_backbone},
-        {"params": model.se.parameters(), "lr": args.lr_head},
+        {"params": model.se.parameters(),   "lr": args.lr_head},
         {"params": model.head.parameters(), "lr": args.lr_head},
     ], weight_decay=1e-4)
-    scheduler = build_scheduler(optimizer, total_epochs=p2, warmup_epochs=min(3, p2 // 4 + 1))
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=max(p2, 1), eta_min=1e-7,
+    )
     best_bal_acc, epoch_offset = run_phase(
         model, train_loader, val_loader, optimizer, scheduler,
         criterion, val_criterion, scaler, device,
         n_epochs=p2, best_bal_acc=best_bal_acc, patience=args.patience,
         best_ckpt_path=best_ckpt_path, history=history,
-        epoch_offset=epoch_offset, ema=ema,
-        mixup_alpha=args.mixup_alpha, mixup_prob=args.mixup_prob,
-        accum_steps=args.accum_steps,
+        epoch_offset=epoch_offset, mixup_alpha=args.mixup_alpha,
     )
     save_checkpoint(model, last_ckpt_path, {"phase": "phase2", "epoch": epoch_offset})
     _save_history()
 
-    # ── Phase 3: full fine-tune (no MixUp — let the model see real images) ───
+    # ── Phase 3: full fine-tune ───────────────────────────────────────────────
     remaining = args.epochs - p1 - p2
     if remaining > 0:
         print(f"\n{'='*60}")
@@ -617,20 +470,20 @@ def main():
         print(f"{'='*60}")
 
         model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
-        ema = ModelEMA(model, decay=args.ema_decay)
         model.unfreeze_all()
         optimizer = optim.AdamW(
             model.parameters(), lr=args.lr_backbone / 3, weight_decay=1e-4,
         )
-        scheduler = build_scheduler(optimizer, total_epochs=remaining, warmup_epochs=min(2, remaining // 4 + 1))
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=max(remaining, 1), eta_min=1e-8,
+        )
         best_bal_acc, epoch_offset = run_phase(
             model, train_loader, val_loader, optimizer, scheduler,
             criterion, val_criterion, scaler, device,
             n_epochs=remaining, best_bal_acc=best_bal_acc, patience=args.patience,
             best_ckpt_path=best_ckpt_path, history=history,
-            epoch_offset=epoch_offset, ema=ema,
-            mixup_alpha=args.mixup_alpha, mixup_prob=0.0,  # MixUp off in final phase
-            accum_steps=args.accum_steps,
+            epoch_offset=epoch_offset, mixup_alpha=args.mixup_alpha,
+            mixup_scale=0.5,
         )
         save_checkpoint(model, last_ckpt_path, {"phase": "phase3", "epoch": epoch_offset})
         _save_history()
@@ -639,7 +492,7 @@ def main():
 
     # ── Final evaluation + write metrics.json ─────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"FINAL EVALUATION  (best EMA val balanced_accuracy = {best_bal_acc:.4f})")
+    print(f"FINAL EVALUATION  (best val balanced_accuracy = {best_bal_acc:.4f})")
     print(f"{'='*60}")
 
     model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
@@ -652,25 +505,26 @@ def main():
     cr_text = classification_report(labels, preds, target_names=CLASS_NAMES, zero_division=0)
     print(cr_text)
 
+    # Build metrics.json exactly as Cell 7 expects
     cr_dict = classification_report(
         labels, preds, target_names=CLASS_NAMES,
         output_dict=True, zero_division=0,
     )
     cm = confusion_matrix(labels, preds, labels=list(range(NUM_CLASSES))).tolist()
-    macro_p = precision_score(labels, preds, average="macro", zero_division=0)
-    macro_r = recall_score(labels, preds, average="macro", zero_division=0)
+    macro_p  = precision_score(labels, preds, average="macro", zero_division=0)
+    macro_r  = recall_score(labels, preds, average="macro",    zero_division=0)
 
     metrics = {
         "final_metrics": {
-            "accuracy": round(val_acc, 4),
-            "balanced_accuracy": round(bal_acc, 4),
-            "precision": round(macro_p, 4),
-            "recall": round(macro_r, 4),
-            "f1": round(val_f1, 4),
-            "auc_roc": round(val_auc, 4) if not np.isnan(val_auc) else None,
-            "loss": round(history[-1]["val_loss"], 4) if history else None,
-            "confusion_matrix": cm,
-            "classification_report": cr_dict,
+            "accuracy":               round(val_acc,  4),
+            "balanced_accuracy":      round(bal_acc,  4),
+            "precision":              round(macro_p,  4),
+            "recall":                 round(macro_r,  4),
+            "f1":                     round(val_f1,   4),
+            "auc_roc":                round(val_auc, 4) if not np.isnan(val_auc) else None,
+            "loss":                   round(history[-1]["val_loss"], 4) if history else None,
+            "confusion_matrix":       cm,
+            "classification_report":  cr_dict,
         }
     }
     Path(args.output_dir, "metrics.json").write_text(json.dumps(metrics, indent=2))

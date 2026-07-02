@@ -12,11 +12,11 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from models.hybrid_model import HerlevHybridClassifier
+from models.model import HerlevMambaClassifier
 from preprocessing import discover_class_directories, list_image_files, ImageRecord, filter_quality_and_duplicates
 from dataset import HerlevDataset, build_eval_transform
 from torch.utils.data import DataLoader
-from training.engine import evaluate
+from train import evaluate
 from losses import build_criterion
 from config import CLASS_NAMES, NUM_CLASSES, DEFAULT_IMAGE_SIZE
 
@@ -105,7 +105,7 @@ def main():
         else:
             num_classes = NUM_CLASSES
 
-    model = HerlevHybridClassifier(
+    model = HerlevMambaClassifier(
         backbone=backbone,
         num_classes=num_classes,
         image_size=image_size,
