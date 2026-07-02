@@ -91,6 +91,35 @@ def load_checkpoint_state_dict(path: str | os.PathLike):
     raise ValueError(f"Unsupported checkpoint format: {path}")
 
 
+def _collect_module_params(model, names):
+    for name in names:
+        module = getattr(model, name, None)
+        if module is not None:
+            return list(module.parameters())
+    return []
+
+
+def _collect_param_groups(model, args):
+    groups = []
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None:
+        backbone_params = [p for p in backbone.parameters() if p.requires_grad]
+        if backbone_params:
+            groups.append({"params": backbone_params, "lr": args.lr_backbone})
+
+    se_params = _collect_module_params(model, ("se",))
+    head_params = _collect_module_params(model, ("head", "classifier", "fc"))
+
+    if se_params:
+        groups.append({"params": se_params, "lr": args.lr_head})
+    if head_params:
+        groups.append({"params": head_params, "lr": args.lr_head})
+    if not groups:
+        groups.append({"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr_head})
+
+    return groups
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MixUp
 # ──────────────────────────────────────────────────────────────────────────────
@@ -443,12 +472,10 @@ def main():
 
     model.load_state_dict(load_checkpoint_state_dict(best_ckpt_path))
     model.unfreeze_backbone(unfreeze_last_n_blocks=3)
-    optimizer = optim.AdamW([
-        {"params": filter(lambda p: p.requires_grad, model.backbone.parameters()),
-         "lr": args.lr_backbone},
-        {"params": model.se.parameters(),   "lr": args.lr_head},
-        {"params": model.head.parameters(), "lr": args.lr_head},
-    ], weight_decay=1e-4)
+    optimizer = optim.AdamW(
+        _collect_param_groups(model, args),
+        weight_decay=1e-4,
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=max(p2, 1), eta_min=1e-7,
     )
