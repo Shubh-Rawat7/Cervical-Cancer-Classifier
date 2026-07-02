@@ -76,8 +76,7 @@ def build_train_transform(image_size: int = DEFAULT_IMAGE_SIZE) -> A.Compose:
             A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
             A.MedianBlur(blur_limit=3, p=0.2),
             A.RandomResizedCrop(
-                height=image_size,
-                width=image_size,
+                size=(image_size, image_size),
                 scale=(0.9, 1.0),
                 ratio=(0.95, 1.05),
                 interpolation=cv2.INTER_CUBIC,
@@ -87,7 +86,7 @@ def build_train_transform(image_size: int = DEFAULT_IMAGE_SIZE) -> A.Compose:
             A.VerticalFlip(p=0.5),
             A.Rotate(limit=20, p=0.7),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.7),
-            A.GaussNoise(var_limit=(10.0, 40.0), p=0.35),
+            A.GaussNoise(std_range=(0.05, 0.15), p=0.35),
             A.Affine(scale=(0.9, 1.1), translate_percent=(0.05, 0.08), rotate=(-12, 12), shear=(-8, 8), p=0.6),
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ToTensorV2(),

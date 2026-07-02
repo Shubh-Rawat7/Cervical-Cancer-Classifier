@@ -325,7 +325,7 @@ def _run_stage(
     args: argparse.Namespace,
     history: list[dict[str, Any]],
     global_epoch: int,
-    best_bal_acc: float,
+    best_val_acc: float,
     best_path: Path,
     scaler: GradScaler,
     swa_model: AveragedModel | None,
@@ -395,8 +395,8 @@ def _run_stage(
             f"BalAcc={val_metrics['balanced_accuracy']:.3f} F1={val_metrics['f1']:.3f}"
         )
 
-        if val_metrics["balanced_accuracy"] > best_bal_acc:
-            best_bal_acc = float(val_metrics["balanced_accuracy"])
+        if val_metrics["accuracy"] > best_val_acc:
+            best_val_acc = float(val_metrics["accuracy"])
             stale_epochs = 0
             save_checkpoint(
                 model,
@@ -416,14 +416,14 @@ def _run_stage(
                     "class_names": CLASS_NAMES,
                 },
             )
-            print(f"    ✓ Best model saved at bal_acc={best_bal_acc:.4f}")
+            print(f"    ✓ Best model saved at val_acc={best_val_acc:.4f}")
         else:
             stale_epochs += 1
             if stale_epochs >= args.patience:
                 print(f"    Early stopping triggered after {args.patience} stale epochs.")
-                return global_epoch, best_bal_acc, True
+                return global_epoch, best_val_acc, True
 
-    return global_epoch, best_bal_acc, False
+    return global_epoch, best_val_acc, False
 
 
 def _save_history(history: Sequence[dict[str, Any]], output_dir: Path) -> None:
@@ -468,7 +468,7 @@ def main() -> TrainArtifacts:
         under_sample=False,
     )
 
-    model = build_model(num_classes=NUM_CLASSES, backbone_name=args.backbone, dropout=args.dropout, pretrained=True).to(device)
+    model = build_model(num_classes=NUM_CLASSES, backbone=args.backbone, dropout=args.dropout, pretrained=True).to(device)
     counts_tensor = torch.tensor([train_counts[name] for name in class_names], dtype=torch.float32, device=device)
     criterion = build_criterion(counts_tensor, loss_type="cb_focal", gamma=args.cb_gamma, beta=args.cb_beta)
     val_criterion = nn.CrossEntropyLoss(weight=(counts_tensor.sum() / counts_tensor.clamp_min(1.0)).to(device))
@@ -478,7 +478,7 @@ def main() -> TrainArtifacts:
     best_path = output_dir / "best_model.pt"
     last_path = output_dir / "last_model.pt"
     swa_path = output_dir / "swa_model.pt"
-    best_bal_acc = 0.0
+    best_val_acc = 0.0
     epoch = 0
 
     swa_start_epoch = max(1, args.epochs - args.swa_epochs + 1)
@@ -494,7 +494,7 @@ def main() -> TrainArtifacts:
     for stage_index, stage_epochs in stage_plan:
         if stage_epochs <= 0:
             continue
-        epoch, best_bal_acc, stop_training = _run_stage(
+        epoch, best_val_acc, stop_training = _run_stage(
             model=model,
             stage_index=stage_index,
             epochs=stage_epochs,
@@ -506,7 +506,7 @@ def main() -> TrainArtifacts:
             args=args,
             history=history,
             global_epoch=epoch,
-            best_bal_acc=best_bal_acc,
+            best_val_acc=best_val_acc,
             best_path=best_path,
             scaler=scaler,
             swa_model=swa_model,
