@@ -30,7 +30,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import label_binarize
 
-from models.hybrid_model import build_model
+from models.cnn_model import build_model
 
 
 def set_seed(seed: int = 42):
@@ -394,7 +394,7 @@ def main():
     # ── Model + loss ──────────────────────────────────────────────────────────
     model          = build_model(
         num_classes=NUM_CLASSES,
-        backbone=args.backbone,
+        backbone_name=args.backbone,
         dropout=args.dropout,
     ).to(device)
     class_weights  = get_class_weights(train_ds, device)
