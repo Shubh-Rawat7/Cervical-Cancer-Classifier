@@ -19,12 +19,11 @@ const STAGE_DESCRIPTIONS = {
 function normalizeResult(data) {
   if (!data) return null;
 
-  // Support both snake_case and camelCase key variants from the backend
   const predictedClass =
-    data.predicted_class ||
-    data.prediction ||
-    data.class ||
-    data.label ||
+    data.predicted_class ??
+    data.prediction ??
+    data.class ??
+    data.label ??
     null;
 
   const confidence =
@@ -34,10 +33,18 @@ function normalizeResult(data) {
     null;
 
   const probabilities =
-    data.probabilities ||
-    data.probs ||
-    data.class_probabilities ||
+    data.probabilities ??
+    data.probs ??
+    data.class_probabilities ??
     null;
+
+  if (probabilities && typeof probabilities === 'object' && !Array.isArray(probabilities)) {
+    const normalizedProbabilities = {};
+    Object.entries(probabilities).forEach(([key, value]) => {
+      normalizedProbabilities[key] = Number(value);
+    });
+    return { predicted_class: predictedClass, confidence, probabilities: normalizedProbabilities };
+  }
 
   return { predicted_class: predictedClass, confidence, probabilities };
 }

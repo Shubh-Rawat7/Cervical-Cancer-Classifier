@@ -129,6 +129,7 @@ class HerlevMambaClassifier(nn.Module):
         dropout: float = 0.2,
         activation: str = "silu",
         pretrained: bool = True,
+        head_hidden: Optional[int] = None,
     ):
         super().__init__()
         self.backbone_name = backbone
@@ -175,7 +176,7 @@ class HerlevMambaClassifier(nn.Module):
         self.attn_norm = nn.LayerNorm(embed_dim)
         self.mamba_blocks = nn.ModuleList([MambaMixerBlock(embed_dim, dropout=dropout, activation=activation) for _ in range(mamba_layers)])
         self.final_norm = nn.LayerNorm(embed_dim)
-        hidden_dim = max(embed_dim // 2, 128)
+        hidden_dim = head_hidden if head_hidden is not None else max(embed_dim // 2, 128)
         self.head = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(embed_dim, hidden_dim),
@@ -281,6 +282,32 @@ def _extract_state_dict(checkpoint) -> Dict[str, torch.Tensor]:
     raise ValueError("Checkpoint does not contain a compatible state dict")
 
 
+def _infer_checkpoint_config(state_dict: Dict[str, torch.Tensor], metadata: Optional[dict] = None) -> Tuple[int, Optional[int], int]:
+    metadata = metadata or {}
+    embed_dim = None
+    head_hidden = None
+    num_classes = None
+
+    if "embed_dim" in metadata:
+        embed_dim = int(metadata["embed_dim"])
+    elif "head.1.weight" in state_dict:
+        embed_dim = int(state_dict["head.1.weight"].shape[1])
+    elif "cls_token" in state_dict:
+        embed_dim = int(state_dict["cls_token"].shape[-1])
+    elif "pos_embed" in state_dict:
+        embed_dim = int(state_dict["pos_embed"].shape[-1])
+
+    if "head.1.weight" in state_dict:
+        head_hidden = int(state_dict["head.1.weight"].shape[0])
+
+    if "num_classes" in metadata:
+        num_classes = int(metadata["num_classes"])
+    elif "head.5.weight" in state_dict:
+        num_classes = int(state_dict["head.5.weight"].shape[0])
+
+    return embed_dim or 256, head_hidden, num_classes or NUM_CLASSES
+
+
 def load_model(checkpoint_path: str | Path, device: Optional[torch.device | str] = None):
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -288,13 +315,35 @@ def load_model(checkpoint_path: str | Path, device: Optional[torch.device | str]
 
     metadata = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
     backbone = metadata.get("backbone", checkpoint.get("backbone", "vim_base_patch16_224"))
-    num_classes = int(metadata.get("num_classes", checkpoint.get("num_classes", NUM_CLASSES)))
     image_size = int(metadata.get("image_size", checkpoint.get("image_size", DEFAULT_IMAGE_SIZE)))
-    embed_dim = int(metadata.get("embed_dim", checkpoint.get("embed_dim", 256)))
     mamba_layers = int(metadata.get("mamba_layers", checkpoint.get("mamba_layers", 2)))
     attn_heads = int(metadata.get("attn_heads", checkpoint.get("attn_heads", 4)))
     dropout = float(metadata.get("dropout", checkpoint.get("dropout", 0.2)))
     activation = str(metadata.get("activation", checkpoint.get("activation", "silu")))
+    embed_dim, head_hidden, num_classes = _infer_checkpoint_config(state_dict, metadata)
+
+    # The checkpoint currently in the repo was produced by the older EfficientNet-based
+    # classifier, not the newer Mamba architecture. Use the matching architecture whenever
+    # the state dict contains backbone.conv_stem.* or a 512-unit head, which keeps the
+    # trained weights usable instead of silently loading a mostly untrained model.
+    uses_cnn_checkpoint = any(key.startswith("backbone.conv_stem") for key in state_dict) or (
+        "head.1.weight" in state_dict and tuple(state_dict["head.1.weight"].shape) == (512, 1280)
+    )
+
+    if uses_cnn_checkpoint:
+        from .cnn_model import build_model
+
+        model = build_model(num_classes=num_classes, dropout=dropout, backbone_name=backbone)
+        model_state = model.state_dict()
+        compatible_state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key in model_state and tuple(value.shape) == tuple(model_state[key].shape)
+        }
+        model.load_state_dict(compatible_state_dict, strict=False)
+        model.to(device)
+        model.eval()
+        return model
 
     model = HerlevMambaClassifier(
         backbone=backbone,
@@ -306,8 +355,16 @@ def load_model(checkpoint_path: str | Path, device: Optional[torch.device | str]
         dropout=dropout,
         activation=activation,
         pretrained=False,
+        head_hidden=head_hidden,
     )
-    model.load_state_dict(state_dict, strict=False)
+
+    model_state = model.state_dict()
+    compatible_state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if key in model_state and tuple(value.shape) == tuple(model_state[key].shape)
+    }
+    model.load_state_dict(compatible_state_dict, strict=False)
     model.to(device)
     model.eval()
     return model
